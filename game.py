@@ -171,22 +171,35 @@ def add_coin_to_slots(slots, level):
 
 
 def process_combines(slots, currency, prestige_mult):
-	# for each slot, if count >= SLOT_CAPACITY, combine into next level
+	# Process combines by promoting groups from slots into new coins (distributed across slots).
 	gained = 0
-	for s in slots:
-		if s.is_empty():
-			continue
-		# while there are enough coins to promote
-		while s.count >= SLOT_CAPACITY:
-			carry = s.count // SLOT_CAPACITY
-			s.count = s.count % SLOT_CAPACITY
-			# increase coin level by carry, and award currency for each promotion
-			for _ in range(carry):
-				s.coin += 1
-				gained += coin_value(s.coin)
-		# if count dropped to zero, mark slot empty
-		if s.count == 0:
-			s.coin = 0
+	# Repeat until no promotions occur (to allow cascading across slots)
+	promoted_any = True
+	while promoted_any:
+		promoted_any = False
+		for s in slots:
+			if s.is_empty():
+				continue
+			if s.count >= SLOT_CAPACITY:
+				promos = s.count // SLOT_CAPACITY
+				s.count = s.count % SLOT_CAPACITY
+				# create `promos` coins of level s.coin+1
+				for _ in range(promos):
+					target_level = s.coin + 1
+					placed = add_coin_to_slots(slots, target_level)
+					# if unable to place (no free slot), place the promoted coin into this slot
+					if not placed:
+						# overwrite this slot with the promoted coin
+						s.coin = target_level
+						s.count = 1
+						gained += coin_value(target_level)
+						promoted_any = True
+					else:
+						gained += coin_value(target_level)
+						promoted_any = True
+				# if this slot emptied, mark empty
+				if s.count == 0:
+					s.coin = 0
 	gained = int(gained * prestige_mult)
 	currency += gained
 	return currency, gained
@@ -259,13 +272,17 @@ def main():
 	btn_save = make_button((50, 650, 120, 34), "Save")
 	btn_load = make_button((190, 650, 120, 34), "Load")
 	btn_fullscreen = make_button((350, 650, 140, 34), "Fullscreen")
-	# buy coin buttons for types 1-3 (wider and more spaced to fit labels)
-	btn_buy_coin = []
-	buy_base_x = 600
-	buy_spacing = 150
-	buy_width = 140
-	for i in range(3):
-		btn_buy_coin.append(make_button((buy_base_x + i * buy_spacing, 600, buy_width, 40), f"Buy C{i+1}"))
+	# single Buy menu button (opens small popup with options)
+	# buy menu positioned with equal spacing from other buttons
+	btn_buy_menu = make_button((560, 600, 140, 40), "Buy Coins")
+	# shift UI buttons left slightly to make room for the market chart
+	btn_deal = make_button((20, 600, 160, 40), "Deal Coins")
+	btn_buy_slot = make_button((200, 600, 160, 40), "Buy Slot")
+	btn_prestige = make_button((380, 600, 160, 40), "Prestige")
+	btn_save = make_button((20, 650, 120, 34), "Save")
+	btn_load = make_button((160, 650, 120, 34), "Load")
+	btn_fullscreen = make_button((320, 650, 140, 34), "Fullscreen")
+	buy_popup = None  # {'rect':Rect, 'options':[{'rect':Rect,'level':int,'cost':int}]}
 
 	# dragging state
 	dragging = False
@@ -275,6 +292,60 @@ def main():
 	drag_pos = (0, 0)
 
 	is_fullscreen = False
+	# sell popup when shift+clicking a slot
+	sell_popup = None  # {'level': int, 'rect': Rect, 'sell1':Rect,'sell5':Rect,'sell_all':Rect}
+
+	# market price history for chart: level -> list of recent displayed prices
+	price_history = {}
+	price_history_max = 80
+
+	# recent sales history used for pricing: level -> deque of last ~1000 sale prices
+	from collections import deque, defaultdict
+	market_sales_history = defaultdict(lambda: deque(maxlen=1000))
+	# parallel timestamps for recent sales to compute volume-driven effects
+	market_sales_timestamps = defaultdict(lambda: deque(maxlen=1000))
+
+	# computed current prices (updated on actions)
+	current_prices = {}
+
+	# price update throttle (seconds) - update every 1s per request
+	price_update_interval = 1.0
+	last_price_update = 0.0
+
+	def update_market_prices():
+		# compute prices from recent sales history and recent sale volume
+		max_samples = 100
+		lookback_secs = 60.0
+		max_display_level_local = max(3, max((s.coin for s in slots), default=0))
+		now_ts = pygame.time.get_ticks() / 1000.0
+		for lvl in range(1, max_display_level_local + 1):
+			price_hist = list(market_sales_history.get(lvl, []))
+			ts_hist = list(market_sales_timestamps.get(lvl, []))
+			if price_hist:
+				recent = price_hist[-max_samples:]
+				base_price = int(sum(recent) / len(recent))
+			else:
+				base_price = coin_value(lvl)
+			# compute recent sale volume in lookback window
+			recent_sales_count = 0
+			for t in reversed(ts_hist):
+				if now_ts - t <= lookback_secs:
+					recent_sales_count += 1
+				else:
+					break
+			# demand factor decreases as recent sales increase
+			demand = max(0.3, 1.2 - (recent_sales_count / (10.0 + lvl)))
+			# small noise
+			noise = random.uniform(-0.02, 0.02)
+			price = int(base_price * demand * (1.0 + noise))
+			current_prices[lvl] = max(1, price)
+			# append to small chart history so chart reflects price movements
+			if lvl not in price_history:
+				price_history[lvl] = []
+			price_history[lvl].append(current_prices[lvl])
+			if len(price_history[lvl]) > price_history_max:
+				price_history[lvl].pop(0)
+
 
 	def slot_rect(index):
 		slot_w = 140
@@ -285,6 +356,22 @@ def main():
 		x = start_x + (index % 8) * (slot_w + margin)
 		y = start_y + (index // 8) * (slot_h + margin)
 		return pygame.Rect(x, y, slot_w, slot_h)
+
+	# helpers to detect if a coin of `level` can be placed (without mutating state)
+	def can_place_level(level):
+		for s in slots:
+			if s.coin == level and s.count < SLOT_CAPACITY:
+				return True
+		for s in slots:
+			if s.is_empty():
+				return True
+		return False
+
+	def any_place_up_to(max_level):
+		for lvl in range(1, max_level + 1):
+			if can_place_level(lvl):
+				return True
+		return False
 
 	running = True
 	last_gain = 0
@@ -304,11 +391,73 @@ def main():
 			highest_purchasable = 1
 		buy_levels = [max(1, highest_purchasable - 2), max(1, highest_purchasable - 1), highest_purchasable]
 
+		# allow dealing to spawn coins up to one level above current_max (no hard cap)
+		max_deal_level = max(3, current_max + 1, unlocked_slots)
+
+		# detect no-move (can't place any reasonable coin and can't afford a slot)
+		slot_cost = 100 * (2 ** (unlocked_slots - INITIAL_SLOTS))
+		has_place = any_place_up_to(max_deal_level)
+		no_moves = (not has_place) and (currency < slot_cost)
+
+		# compute supply per level (for UI counts only)
+		supply = {}
+		max_display_level = max(3, current_max)
+		for lvl in range(1, max_display_level + 1):
+			supply[lvl] = sum(s.count for s in slots if s.coin == lvl)
+		# periodic backup update if there are no recorded market prices yet
+		now = pygame.time.get_ticks() / 1000.0
+		if not current_prices:
+			update_market_prices()
+		# periodic market price recalculation (every interval)
+		if now - last_price_update >= price_update_interval:
+			update_market_prices()
+			last_price_update = now
+
+		# sell popup state is managed via `sell_popup`; cleared by clicks elsewhere
+
 		for event in pygame.event.get():
 			if event.type == pygame.QUIT:
 				running = False
 			elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
 				mx, my = event.pos
+				# if no moves, present modal actions first
+				if no_moves:
+					# modal button positions (centered)
+					modal_w, modal_h = 520, 160
+					mx0 = (WIDTH - modal_w) // 2
+					my0 = (HEIGHT - modal_h) // 2
+					buy_rect = pygame.Rect(mx0 + 20, my0 + 80, 140, 48)
+					sell_rect = pygame.Rect(mx0 + 190, my0 + 80, 140, 48)
+					restart_rect = pygame.Rect(mx0 + 360, my0 + 80, 140, 48)
+					if buy_rect.collidepoint((mx, my)):
+						# attempt buy slot
+						if currency >= slot_cost:
+							currency -= slot_cost
+							slots.append(Slot())
+							unlocked_slots += 1
+						continue
+					elif sell_rect.collidepoint((mx, my)):
+						# sell one coin from the highest-level non-empty slot
+						best = None
+						for i, s in enumerate(slots):
+							if not s.is_empty() and s.count > 0:
+								if best is None or s.coin > slots[best].coin:
+									best = i
+						if best is not None:
+							lvl = slots[best].coin
+							slots[best].count -= 1
+							if slots[best].count == 0:
+								slots[best].coin = 0
+							currency += coin_value(lvl) // 2
+						continue
+					elif restart_rect.collidepoint((mx, my)):
+						# restart current run (preserve prestige)
+						slots = [Slot() for _ in range(INITIAL_SLOTS)]
+						unlocked_slots = INITIAL_SLOTS
+						currency = 0
+						last_gain = 0
+						continue
+				# otherwise normal click handling follows
 				# check for slot click to start dragging (priority)
 				clicked_slot = None
 				for i in range(len(slots)):
@@ -316,7 +465,23 @@ def main():
 					if rect.collidepoint((mx, my)) and i < unlocked_slots and not slots[i].is_empty():
 						clicked_slot = i
 						break
+				# Shift+click opens sell popup for that slot
+				mods = pygame.key.get_mods()
 				if clicked_slot is not None and not dragging:
+					if mods & pygame.KMOD_SHIFT:
+						lvl = slots[clicked_slot].coin
+						# popup near slot
+						rect = slot_rect(clicked_slot)
+						pw, ph = 220, 44
+						px = rect.x + (rect.width - pw) // 2
+						py = rect.y + rect.height + 6
+						r = pygame.Rect(px, py, pw, ph)
+						r1 = pygame.Rect(px + 8, py + 10, 44, 24)
+						r5 = pygame.Rect(px + 60, py + 10, 44, 24)
+						rall = pygame.Rect(px + 116, py + 10, 88, 24)
+						sell_popup = {"level": lvl, "rect": r, "sell1": r1, "sell5": r5, "sell_all": rall}
+						continue
+					# otherwise pick up for dragging
 					# pick up one coin from the slot
 					src = slots[clicked_slot]
 					drag_level = src.coin
@@ -332,7 +497,8 @@ def main():
 				if btn_deal["rect"].collidepoint((mx, my)):
 					# deal one coin per unlocked slot
 					for _ in range(unlocked_slots):
-						lvl = weighted_random_coin(max_level=min(5, unlocked_slots))
+						# spawn up to max_deal_level
+						lvl = weighted_random_coin(max_level=min(max_deal_level, unlocked_slots + 2))
 						add_coin_to_slots(slots, lvl)
 					currency, last_gain = process_combines(slots, currency, prestige_mult)
 				elif btn_buy_slot["rect"].collidepoint((mx, my)):
@@ -377,16 +543,102 @@ def main():
 						currency = data.get("currency", 0)
 						prestige_level = data.get("prestige_level", 0)
 						prestige_mult = 1.0 + prestige_level * 0.1
-				# Buy coin buttons (always active)
+				# Buy coin menu handling and sell-popup handling
 				else:
-					for i, b in enumerate(btn_buy_coin):
-						lvl = buy_levels[i]
-						cost = coin_value(lvl)
-						if b["rect"].collidepoint((mx, my)):
-							if currency >= cost and lvl <= highest_purchasable:
-								currency -= cost
-								add_coin_to_slots(slots, lvl)
-								currency, last_gain = process_combines(slots, currency, prestige_mult)
+					# Buy menu toggle
+					if btn_buy_menu["rect"].collidepoint((mx, my)):
+						if buy_popup:
+							buy_popup = None
+						else:
+							# create popup with current buy_levels
+							pw, ph = 240, 120
+							px = btn_buy_menu["rect"].x
+							py = btn_buy_menu["rect"].y - ph - 6
+							opts = []
+							for i, lvl in enumerate(buy_levels):
+								x = px + 8
+								y = py + 8 + i * 36
+								rect = pygame.Rect(x, y, pw - 16, 28)
+								opts.append({"rect": rect, "level": lvl, "cost": coin_value(lvl)})
+							buy_popup = {"rect": pygame.Rect(px, py, pw, ph), "options": opts}
+						continue
+					# handle buy popup clicks
+					if buy_popup:
+						handled = False
+						for opt in buy_popup["options"]:
+							if opt["rect"].collidepoint((mx, my)):
+								lvl = opt["level"]
+								cost = opt["cost"]
+								if currency >= cost and lvl <= highest_purchasable:
+									currency -= cost
+									add_coin_to_slots(slots, lvl)
+									currency, last_gain = process_combines(slots, currency, prestige_mult)
+									handled = True
+									update_market_prices()
+									break
+						if handled:
+							buy_popup = None
+						else:
+							buy_popup = None
+					# handle sell popup clicks if present
+					if sell_popup:
+						lvl = sell_popup["level"]
+						# sell 1
+						if sell_popup["sell1"].collidepoint((mx, my)):
+							price = current_prices.get(lvl, coin_value(lvl))
+							sold = 0
+							for s in slots:
+								if s.coin == lvl and s.count > 0:
+									s.count -= 1
+									if s.count == 0:
+										s.coin = 0
+									currency += price
+									market_sales_history[lvl].append(price)
+									# record sale
+									sold += 1
+									# append timestamp using pygame time (seconds since init)
+									_market_now = pygame.time.get_ticks() / 1000.0
+									market_sales_timestamps[lvl].append(_market_now)
+									break
+							if sold:
+								update_market_prices()
+							sell_popup = None
+						# sell 5
+						elif sell_popup["sell5"].collidepoint((mx, my)):
+							price = current_prices.get(lvl, coin_value(lvl))
+							sold = 0
+							for s in slots:
+								while s.coin == lvl and s.count > 0 and sold < 5:
+									s.count -= 1
+									currency += price
+									market_sales_history[lvl].append(price)
+									_market_now = pygame.time.get_ticks() / 1000.0
+									market_sales_timestamps[lvl].append(_market_now)
+									sold += 1
+								if s.count == 0:
+									s.coin = 0
+							if sold:
+								update_market_prices()
+							sell_popup = None
+						# sell all
+						elif sell_popup["sell_all"].collidepoint((mx, my)):
+							price = current_prices.get(lvl, coin_value(lvl))
+							total_sold = 0
+							for s in slots:
+								if s.coin == lvl and s.count > 0:
+									n = s.count
+									currency += price * n
+									for _ in range(n):
+										market_sales_history[lvl].append(price)
+									_market_now = pygame.time.get_ticks() / 1000.0
+									for _ in range(n):
+										market_sales_timestamps[lvl].append(_market_now)
+									total_sold += n
+									s.count = 0
+									s.coin = 0
+							if total_sold:
+								update_market_prices()
+							sell_popup = None
 			elif event.type == pygame.MOUSEMOTION:
 				if dragging:
 					drag_pos = event.pos
@@ -489,25 +741,83 @@ def main():
 
 		# draw bottom UI panel
 		pygame.draw.rect(screen, (20, 20, 30), (0, 520, WIDTH, HEIGHT - 520))
-		# update dynamic labels for buy buttons
+		# update dynamic labels for buy slot
 		slot_cost = 100 * (2 ** (unlocked_slots - INITIAL_SLOTS))
 		btn_buy_slot["label"] = f"Buy Slot ({slot_cost})"
-		for i, b in enumerate(btn_buy_coin):
-			lvl = buy_levels[i]
-			cost = coin_value(lvl)
-			b["label"] = f"Buy C{lvl} ({cost})"
+		# prepare buy popup options if open
+		if buy_popup:
+			for opt in buy_popup["options"]:
+				lvl = opt["level"]
+				opt["cost"] = coin_value(lvl)
 
-		# draw main buttons, with disabled state when unaffordable
+		# draw small market chart at bottom-right inside the UI panel (draw first so UI overlays it)
+		chart_w = 480
+		chart_h = 160
+		chart_x = WIDTH - chart_w - 20
+		chart_y = 540
+		pygame.draw.rect(screen, (18, 18, 24), (chart_x, chart_y, chart_w, chart_h))
+		pygame.draw.rect(screen, (90,90,100), (chart_x, chart_y, chart_w, chart_h), 1)
+		# gather levels to plot (up to 6)
+		plot_levels = sorted(price_history.keys())[-6:]
+		colors = [(220,180,60),(180,220,100),(160,160,240),(240,160,200),(200,200,200),(180,140,220)]
+		if plot_levels:
+			# find max price in history window
+			mxp = max(max(price_history[l]) if price_history[l] else 1 for l in plot_levels)
+			for i, lvl in enumerate(plot_levels):
+				hist = price_history.get(lvl, [])
+				if not hist:
+					continue
+				col = colors[i % len(colors)]
+				n = len(hist)
+				for j in range(1, n):
+					x1 = chart_x + int((j-1)/price_history_max * chart_w)
+					x2 = chart_x + int(j/price_history_max * chart_w)
+					y1 = chart_y + chart_h - int((hist[j-1]/mxp) * (chart_h-8)) - 4
+					y2 = chart_y + chart_h - int((hist[j]/mxp) * (chart_h-8)) - 4
+					pygame.draw.line(screen, col, (x1,y1), (x2,y2), 2)
+				# label
+				lbl = render_text(small_font or font, f"C{lvl}", col)
+				screen.blit(lbl, (chart_x + chart_w - 40, chart_y + 4 + i*14))
+
+		# draw main buttons, with disabled state when unaffordable (after chart so buttons are visible)
 		draw_btn(btn_deal)
 		draw_btn(btn_buy_slot, disabled=(currency < slot_cost))
 		draw_btn(btn_prestige, disabled=(currency < 1000 and unlocked_slots==INITIAL_SLOTS))
 		draw_btn(btn_save)
 		draw_btn(btn_load)
 		draw_btn(btn_fullscreen)
-		for i, b in enumerate(btn_buy_coin):
-			lvl = buy_levels[i]
-			cost = coin_value(lvl)
-			draw_btn(b, disabled=(currency < cost or lvl > highest_purchasable))
+		draw_btn(btn_buy_menu)
+
+		# draw sell popup if present (above chart)
+		if sell_popup:
+			lvl = sell_popup["level"]
+			price = current_prices.get(lvl, coin_value(lvl))
+			pygame.draw.rect(screen, (40, 40, 50), sell_popup["rect"], border_radius=6)
+			pygame.draw.rect(screen, (200,200,220), sell_popup["rect"], 2, border_radius=6)
+			t = render_text(small_font or font, f"Sell C{lvl}: {price}", (220,220,220))
+			screen.blit(t, (sell_popup["rect"].x + 8, sell_popup["rect"].y + 6))
+			# draw buttons
+			for r, lbl in ((sell_popup["sell1"], "1"), (sell_popup["sell5"], "5"), (sell_popup["sell_all"], "All")):
+				pygame.draw.rect(screen, (60,100,140), r, border_radius=4)
+				pygame.draw.rect(screen, (200,200,220), r, 1, border_radius=4)
+				ls = render_text(small_font or font, lbl, (255,255,255))
+				screen.blit(ls, (r.x + (r.width - ls.get_width())//2, r.y + (r.height - ls.get_height())//2))
+
+		# draw buy popup if present (on top of chart and buttons)
+		if buy_popup:
+			pygame.draw.rect(screen, (36,36,44), buy_popup["rect"], border_radius=6)
+			pygame.draw.rect(screen, (200,200,220), buy_popup["rect"], 2, border_radius=6)
+			for opt in buy_popup["options"]:
+				r = opt["rect"]
+				lvl = opt["level"]
+				cost = opt.get("cost", coin_value(lvl))
+				disabled = (currency < cost) or (lvl > highest_purchasable)
+				bg = (64,64,74) if disabled else (70,120,180)
+				pygame.draw.rect(screen, bg, r, border_radius=4)
+				pygame.draw.rect(screen, (200,200,220), r, 1, border_radius=4)
+				lbl = f"Buy C{lvl} ({cost})"
+				ls = render_text(small_font or font, lbl, (200,200,200) if disabled else (255,255,255))
+				screen.blit(ls, (r.x + 8, r.y + (r.height - ls.get_height())//2))
 
 		# HUD - stacked to avoid overlap
 		hud_x = 50
@@ -524,6 +834,33 @@ def main():
 		for i, t in enumerate(hud_texts):
 			surf = render_text(small_font or font, t, (220, 220, 200))
 			screen.blit(surf, (hud_x + (i // 2) * 320, hud_y + (i % 2) * line_h))
+
+		# if no moves available, draw modal offering Buy Slot / Sell Coin / Restart
+		if no_moves:
+			modal_w, modal_h = 520, 160
+			mx0 = (WIDTH - modal_w) // 2
+			my0 = (HEIGHT - modal_h) // 2
+			# dim background
+			over = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+			over.fill((0, 0, 0, 160))
+			screen.blit(over, (0, 0))
+			# modal box
+			pygame.draw.rect(screen, (40, 40, 50), (mx0, my0, modal_w, modal_h), border_radius=8)
+			pygame.draw.rect(screen, (200, 200, 220), (mx0, my0, modal_w, modal_h), 2, border_radius=8)
+			msg = render_text(big_font or font, "No available moves", (230, 220, 200))
+			screen.blit(msg, (mx0 + 20, my0 + 20))
+			sub = render_text(small_font or font, "Buy a slot, sell a coin, or restart to continue.", (200, 200, 200))
+			screen.blit(sub, (mx0 + 20, my0 + 56))
+			# buttons
+			buy_rect = pygame.Rect(mx0 + 20, my0 + 80, 140, 48)
+			sell_rect = pygame.Rect(mx0 + 190, my0 + 80, 140, 48)
+			restart_rect = pygame.Rect(mx0 + 360, my0 + 80, 140, 48)
+			# draw buttons
+			for r, lbl in ((buy_rect, "Buy Slot"), (sell_rect, "Sell Coin"), (restart_rect, "Restart")):
+				pygame.draw.rect(screen, (60, 100, 140), r, border_radius=6)
+				pygame.draw.rect(screen, (200, 200, 220), r, 2, border_radius=6)
+				lsurf = render_text(small_font or font, lbl, (255, 255, 255))
+				screen.blit(lsurf, (r.x + (r.width - lsurf.get_width()) // 2, r.y + (r.height - lsurf.get_height()) // 2))
 
 		pygame.display.flip()
 

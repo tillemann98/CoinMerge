@@ -47,7 +47,7 @@ python3 "CombinerGame2/game.py"
 
 Add a screenshot to `CombinerGame2/assets/screenshot.png` and it will render here once pushed to GitHub.
 
-![screenshot placeholder](CombinerGame2/assets/screenshot.png)
+![screenshot placeholder](/assets/screenshot.png)
 
 ## Development notes
 

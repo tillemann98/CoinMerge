@@ -1,79 +1,70 @@
 # Combine Them! (Pygame)
 
-Combine Them! is a small prototype "combine/merge" incremental game built with Pygame. Merge coins to create higher-value coins, sell to influence an in-game market, and unlock slots and prestige upgrades.
+Combine Them! is a small, single-file prototype of a "merge" incremental game built with Pygame. Merge coins to produce higher-value coins, sell them to influence a simple market, unlock more slots, and prestige for permanent bonuses.
 
-This repository contains a single-file prototype ideal for experimentation and iteration.
+This repository is intended for experimentation and quick iteration — the main game file is `game.py` so you can inspect and modify gameplay quickly.
 
-[![Python](https://img.shields.io/badge/python-3.8%2B-blue.svg)](https://www.python.org/)
-[![Pygame](https://img.shields.io/badge/pygame-%3E%3D2.1-brightgreen.svg)](https://www.pygame.org/)
+Badges
+- Python 3.8+ recommended
+- Pygame 2.x
 
-## Features
+Quick start
 
-- Drag-and-drop coin placement and merging
-- Deal (spawn) coins, buy specific coin levels, buy additional slots
-- Sell coins — sales affect a simple market price model and chart
-- Prestige mechanic that grants a permanent multiplier
-- Save/load to JSON
-
-## Prerequisites
-
-- Python 3.8+ (system Python or virtualenv)
-- See `requirements.txt` for Python package requirements
-
-## Install
+1. Create and activate a virtual environment (optional but recommended):
 
 ```bash
-python3 -m venv venv   # optional
+python3 -m venv venv
 source venv/bin/activate
+```
+
+2. Install dependencies:
+
+```bash
 pip install -r requirements.txt
 ```
 
-## Run
+3. Run the game:
 
 ```bash
-python3 "CombinerGame2/game.py"
+python3 game.py
 ```
 
-## Controls
+Core features
 
-- Click `Deal Coins` to spawn coins (one per unlocked slot)
-- Click `Buy Coins` → choose `Buy C#` to purchase a coin of that level
-- Click `Upgrades` → `Buy Slot` to expand your board
-- Shift+click a slot to open the Sell popup (sell 1 / 5 / all)
-- Drag a coin from a slot to another slot to add or merge
-- Use `Save` / `Load` to persist progress to `CombinerGame2/save.json`
+- Drag-and-drop coin placement and merging.
+- "Deal" spawns coins (one per unlocked slot).
+- Buy specific coin levels or unlock additional slots via the Upgrades menu.
+- Sell coins to earn currency — sales affect a simple market price model and a small chart.
+- Prestige resets progress for a permanent multiplier.
+-- Save/load game state to `save.json`.
 
-## Screenshot
+Controls
 
-Screenshot from the game
+- Click `Deal Coins` to spawn coins.
+- Click `Buy Coins` → choose `Buy C#` to purchase a coin at that level.
+- Click `Upgrades` → `Buy Slot` to expand your board, or buy Worker / Time Thief upgrades.
+- Shift+click a slot to open the Sell popup (sell 1 / 5 / all).
+- Drag a coin from a slot to another to add or merge.
+- Use `Save` / `Load` buttons to persist progress.
 
-![screenshot placeholder](/assets/screenshot.png)
+Developer notes
 
-## Development notes
+-- Main code: `game.py` (single-file prototype).
+- Dependencies are listed in `requirements.txt` (Pygame 2.x).
+- The game attempts to use `pygame.font` or `pygame.freetype` and falls back to a tiny 5x7 bitmap renderer if neither is available.
+- The spawn/market logic is intentionally simple and designed to be easy to tweak while you experiment.
 
-- Main code: [CombinerGame2/game.py](CombinerGame2/game.py)
-- Requirements: `requirements.txt` (install via pip)
-- The game tries `pygame.font` and `pygame.freetype` and falls back to a small bitmap renderer if needed.
-- The market uses recent sales history to compute prices; player sells have amplified immediate impact to make market feedback visible in a prototype setting.
+Recommended edits
 
-### Project layout
+- Tweak constants near the top of `game.py` (cooldowns, costs, slot caps) to experiment with balance.
+- The bitmap glyphs live in `BITMAP_FONT` inside `game.py` — add glyphs if you need more characters in the fallback renderer.
 
-- `CombinerGame2/game.py` — main prototype file
-- `CombinerGame2/save.json` — save file created by the game (not tracked by git by default)
-- `CombinerGame2/assets/` — optional screenshots or assets
+Contributing
 
-### Notes on fonts and display
+This is a small prototype — open an issue or submit a PR with improvements. Helpful contributions include UI polish, balancing changes, or packaging the project for distribution.
 
-The prototype attempts to use system font backends. If text looks off, try running in a virtualenv and ensure `pygame` is installed correctly on your platform.
+License
 
-## Contributing
-
-Open an issue or submit a PR with improvements. For UI or balancing tweaks mention expected behavior and screenshots if possible.
-
-## License
-
-This project is provided under the MIT license — see `LICENSE` in the repository for details.
+This project is provided under the MIT License.
 
 ---
-
-If you'd like, I can also add CI badges, a small contributing guide, or create a sample GitHub Actions workflow to run a simple static check. Which would you prefer next?

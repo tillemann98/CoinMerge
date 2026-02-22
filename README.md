@@ -72,4 +72,3 @@ This is a small prototype — open an issue or submit a PR with improvements. Us
 
 This project is provided under the MIT License.
 
----

@@ -1,4 +1,5 @@
 import pygame
+import traceback
 import random
 import sys
 import json
@@ -25,6 +26,16 @@ except Exception:
 WIDTH, HEIGHT = 1280, 720
 SLOT_CAPACITY = 10
 INITIAL_SLOTS = 5
+WORKER_COST = 1000
+TIME_THIEF_COST = 500
+TIME_THIEF_REDUCTION = 0.25  # seconds reduced per Time Thief purchased
+# minimum possible manual deal cooldown (player-controlled)
+MIN_DEAL_COOLDOWN = 0.25
+DEAL_WEIGHT_DECAY = 2.0  # decay factor for deal weighting: higher -> stronger bias to small coins
+# UI layout limits
+MAX_SLOTS_PER_ROW = 6
+# game limits
+MAX_SLOTS = 18
 
 
 class Slot:
@@ -93,19 +104,36 @@ BITMAP_FONT = {
 	"/": [0x01,0x02,0x04,0x08,0x10,0x00,0x00],
 	"?": [0x0E,0x11,0x01,0x06,0x04,0x00,0x04],
 	"%": [0x18,0x19,0x02,0x04,0x08,0x13,0x03],
+	"&": [0x0E,0x11,0x0E,0x1B,0x13,0x12,0x0D],
 	"(": [0x02,0x04,0x08,0x08,0x08,0x04,0x02],
 	")": [0x08,0x04,0x02,0x02,0x02,0x04,0x08],
 	".": [0x00,0x00,0x00,0x00,0x00,0x04,0x04],
 	",": [0x00,0x00,0x00,0x00,0x00,0x04,0x08],
-}
+	";": [0x00,0x18,0x18,0x00,0x00,0x04,0x08],
+	"=": [0x00,0x00,0x00,0x1F,0x00,0x1F,0x00],
+	}
 
 
 def render_bitmap_text(text, color=(255, 255, 255), scale=2, spacing=1):
 	text = text.upper()
 	rows = 7
 	char_w = 5
+	# sanitize params to avoid invalid Surface sizes (zero/negative)
+	scale = int(scale) if isinstance(scale, (int, float)) else 2
+	spacing = int(spacing) if isinstance(spacing, (int, float)) else 1
+	if scale < 1:
+		scale = 1
+	if spacing < 0:
+		spacing = 0
+	# empty text -> return a tiny transparent surface
+	if not text:
+		height = max(1, rows * scale)
+		return pygame.Surface((1, height), pygame.SRCALPHA)
 	width = sum((char_w * scale) + spacing for _ in text) - spacing
-	height = rows * scale
+	height = max(1, rows * scale)
+	# clamp width to at least 1 to avoid pygame.error: Invalid resolution for Surface
+	if width < 1:
+		width = 1
 	surf = pygame.Surface((width, height), pygame.SRCALPHA)
 	x = 0
 	for ch in text:
@@ -209,11 +237,158 @@ def process_combines(slots, currency, prestige_mult):
 	return currency, gained
 
 
-def weighted_random_coin(max_level=5):
-	# weights favor lower coins; allow up to max_level
-	base_weights = [50, 30, 12, 6, 2]
-	weights = base_weights[:max_level]
-	return random.choices(range(1, len(weights) + 1), weights=weights, k=1)[0]
+def weighted_random_coin(*args, **kwargs):
+	"""Compatibility wrapper:
+	- New usage: weighted_random_coin(slots, cap=...)
+	- Old usage: weighted_random_coin(max_level=...)
+	"""
+	# detect old-style call
+	max_level = kwargs.get('max_level', None)
+	cap = kwargs.get('cap', None)
+	slots = None
+	if args:
+		first = args[0]
+		if isinstance(first, list):
+			slots = first
+		elif isinstance(first, int):
+			max_level = first
+
+	if slots is None:
+		# fallback to original fixed-weight behavior when called with max_level
+		if max_level is None:
+			max_level = 5
+		base_weights = [50, 30, 12, 6, 2]
+		weights = base_weights[:max_level]
+		return random.choices(range(1, len(weights) + 1), weights=weights, k=1)[0]
+
+	# New behavior: include baseline low levels (C1-C3) plus any levels present in slots,
+	# but ensure C1-C3 together have ~95% probability while higher levels share ~5%.
+	# Also respect placement availability (same-level slot with room or any empty slot).
+	present = {s.coin for s in slots if s.coin}
+	# baseline low levels (respect cap)
+	base_max = 3
+	if cap is not None:
+		base_max = min(base_max, cap)
+	base_levels = set(range(1, base_max + 1))
+	candidate_levels = sorted(present | base_levels)
+
+	def _can_place(level):
+		for s in slots:
+			if s.coin == level and s.count < SLOT_CAPACITY:
+				return True
+		for s in slots:
+			if s.is_empty():
+				return True
+		return False
+
+	# filter to only placeable levels
+	levels = [l for l in candidate_levels if _can_place(l)]
+	# if no placeable levels remain, try to find any placeable up to cap
+	if not levels:
+		max_try = cap if cap is not None else max(5, max(present) if present else 3)
+		found = None
+		for l in range(1, max_try + 1):
+			if _can_place(l):
+				found = l
+				break
+		if found is None:
+			return 1
+		levels = [found]
+
+	# Partition low (<=3) and high (>3)
+	low_levels = [l for l in levels if l <= 3]
+	high_levels = [l for l in levels if l > 3]
+
+	# Desired mass percents
+	LOW_MASS = 95.0
+	HIGH_MASS = max(0.0, 100.0 - LOW_MASS)
+
+	weights = []
+	if low_levels:
+		low_share = LOW_MASS / len(low_levels)
+	else:
+		low_share = 0.0
+
+	if high_levels:
+		min_high = min(high_levels)
+		raw = [DEAL_WEIGHT_DECAY ** (-(l - min_high)) for l in high_levels]
+		sum_raw = sum(raw)
+		scaled = [(r / sum_raw) * HIGH_MASS for r in raw]
+		high_map = dict(zip(high_levels, scaled))
+	else:
+		high_map = {}
+
+	for l in levels:
+		if l in low_levels:
+			weights.append(low_share)
+		else:
+			weights.append(high_map.get(l, 0.0))
+
+	return random.choices(levels, weights=weights, k=1)[0]
+
+
+def compute_spawn_probabilities(slots, cap=None):
+	"""Return a dict level->percent for spawn probabilities given current slots.
+	Mirrors the selection logic used by weighted_random_coin for the slots case.
+	"""
+	present = {s.coin for s in slots if s.coin}
+	base_max = 3
+	if cap is not None:
+		base_max = min(base_max, cap)
+	base_levels = set(range(1, base_max + 1))
+	candidate_levels = sorted(present | base_levels)
+
+	def _can_place(level):
+		for s in slots:
+			if s.coin == level and s.count < SLOT_CAPACITY:
+				return True
+		for s in slots:
+			if s.is_empty():
+				return True
+		return False
+
+	levels = [l for l in candidate_levels if _can_place(l)]
+	if not levels:
+		max_try = cap if cap is not None else max(5, max(present) if present else 3)
+		for l in range(1, max_try + 1):
+			if _can_place(l):
+				levels = [l]
+				break
+		if not levels:
+			return {1: 100.0}
+
+	low_levels = [l for l in levels if l <= 3]
+	high_levels = [l for l in levels if l > 3]
+
+	LOW_MASS = 95.0
+	HIGH_MASS = max(0.0, 100.0 - LOW_MASS)
+
+	weights = []
+	if low_levels:
+		low_share = LOW_MASS / len(low_levels)
+	else:
+		low_share = 0.0
+
+	if high_levels:
+		min_high = min(high_levels)
+		raw = [DEAL_WEIGHT_DECAY ** (-(l - min_high)) for l in high_levels]
+		sum_raw = sum(raw)
+		scaled = [(r / sum_raw) * HIGH_MASS for r in raw]
+		high_map = dict(zip(high_levels, scaled))
+	else:
+		high_map = {}
+
+	for l in levels:
+		if l in low_levels:
+			weights.append(low_share)
+		else:
+			weights.append(high_map.get(l, 0.0))
+
+	total = sum(weights)
+	if total <= 0:
+		return {1: 100.0}
+	probs = {l: (w / total) * 100.0 for l, w in zip(levels, weights)}
+	return probs
 
 
 def main():
@@ -270,6 +445,36 @@ def main():
 				return f.render(text, True, color)
 			except Exception:
 				return render_bitmap_text(text, color=color, scale=2)
+
+	# wrapped text renderer: returns a surface constrained to max_width with word wrapping
+	def render_text_wrapped(f, text, color, max_width, line_spacing=6):
+		words = str(text).split(' ')
+		lines = []
+		cur = ''
+		for w in words:
+			if cur:
+				test = cur + ' ' + w
+			else:
+				test = w
+			# measure width
+			surf_test = render_text(f, test, color)
+			if surf_test.get_width() <= max_width:
+				cur = test
+			else:
+				if cur:
+					lines.append(cur)
+				cur = w
+		if cur:
+			lines.append(cur)
+		# render each line and blit onto a combined surface
+		line_surfs = [render_text(f, l, color) for l in lines]
+		total_h = sum(s.get_height() for s in line_surfs) + max(0, (len(line_surfs) - 1) * line_spacing)
+		out = pygame.Surface((max_width, max(1, total_h)), pygame.SRCALPHA)
+		y = 0
+		for s in line_surfs:
+			out.blit(s, (0, y))
+			y += s.get_height() + line_spacing
+		return out
 	# UI buttons
 	btn_deal = make_button((50, 600, 160, 40), "Deal Coins")
 	btn_buy_slot = make_button((230, 600, 160, 40), "Buy Slot")
@@ -288,8 +493,13 @@ def main():
 	btn_save = make_button((20, 650, 120, 34), "Save")
 	btn_load = make_button((160, 650, 120, 34), "Load")
 	btn_fullscreen = make_button((320, 650, 140, 34), "Fullscreen")
+	btn_help = make_button((480, 650, 120, 34), "Help")
+	# place worker toggle in a third row (compact) to avoid overlapping chart
+	btn_worker_toggle = make_button((20, 694, 140, 24), "Worker:Off")
 	buy_popup = None  # {'rect':Rect, 'options':[{'rect':Rect,'level':int,'cost':int}]}
 	upgrades_popup = None
+	prestige_popup = None
+	help_popup = None
 
 	# game state
 	slots = [Slot() for _ in range(INITIAL_SLOTS)]
@@ -297,6 +507,13 @@ def main():
 	currency = 2500
 	prestige_mult = 1.0
 	prestige_level = 0
+	# Worker upgrade state
+	worker_owned = False
+	worker_enabled = False
+	worker_last_deal_time = pygame.time.get_ticks() / 1000.0
+
+	# Time Thief upgrade state (reduces cooldowns)
+	time_thief_count = 0
 
 	# dragging state
 	dragging = False
@@ -327,8 +544,15 @@ def main():
 	# price update throttle (seconds) - update every 1s per request
 	price_update_interval = 1.0
 	last_price_update = 0.0
-	# deal cooldown (seconds)
+	# deal cooldown (base seconds)
 	deal_cooldown = 5.0
+	def effective_deal_cooldown():
+		return max(MIN_DEAL_COOLDOWN, deal_cooldown - time_thief_count * TIME_THIEF_REDUCTION)
+
+	def max_time_thief_count():
+		# compute how many Time Thiefs can be purchased before reaching MIN_DEAL_COOLDOWN
+		maxc = int((deal_cooldown - MIN_DEAL_COOLDOWN) / TIME_THIEF_REDUCTION)
+		return max(0, maxc)
 	last_deal_time = -9999.0
 
 	def update_market_prices():
@@ -393,10 +617,34 @@ def main():
 		slot_w = 140
 		slot_h = 140
 		margin = 20
-		start_x = 50
-		start_y = 50
-		x = start_x + (index % 8) * (slot_w + margin)
-		y = start_y + (index // 8) * (slot_h + margin)
+		# horizontal padding from screen edges
+		left_pad = 50
+		right_pad = 50
+		available_width = WIDTH - left_pad - right_pad
+		# compute maximum columns that fit given slot width+margin
+		max_cols = max(1, int((available_width + margin) // (slot_w + margin)))
+		# cap columns to a sensible maximum so rows wrap earlier on wide screens
+		max_cols = min(max_cols, MAX_SLOTS_PER_ROW)
+		# number of columns we'll use (don't exceed unlocked_slots)
+		cols = min(max_cols, max(1, unlocked_slots))
+		# ensure the computed cols actually fits in the available width
+		while cols > 1 and (cols * slot_w + (cols - 1) * margin) > available_width:
+			cols -= 1
+		# which row and column this index is in
+		row = index // cols
+		col = index % cols
+		# compute how many items are in this row (last row may be shorter)
+		items_in_row = cols
+		# if this is the last row, it might have fewer items
+		total_rows = (unlocked_slots + cols - 1) // cols
+		if row == total_rows - 1:
+			# items remaining
+			items_in_row = max(1, unlocked_slots - row * cols)
+		# center the row horizontally
+		row_width = items_in_row * slot_w + max(0, items_in_row - 1) * margin
+		x_start = left_pad + (available_width - row_width) // 2
+		x = x_start + col * (slot_w + margin)
+		y = 50 + row * (slot_h + margin)
 		return pygame.Rect(x, y, slot_w, slot_h)
 
 	# helpers to detect if a coin of `level` can be placed (without mutating state)
@@ -461,6 +709,22 @@ def main():
 		for event in pygame.event.get():
 			if event.type == pygame.QUIT:
 				running = False
+			elif event.type == pygame.MOUSEWHEEL:
+				# scroll help popup content when wheel used over the popup
+				if help_popup and isinstance(help_popup, dict):
+					mx, my = pygame.mouse.get_pos()
+					if help_popup["rect"].collidepoint((mx, my)):
+						delta = -event.y * 24
+						help_popup["scroll"] = max(0, help_popup.get("scroll", 0) + delta)
+						continue
+				# otherwise fall through
+			elif event.type == pygame.MOUSEBUTTONDOWN and event.button in (4, 5):
+				# legacy wheel events: 4 = up, 5 = down
+				mx, my = event.pos
+				if help_popup and isinstance(help_popup, dict) and help_popup["rect"].collidepoint((mx, my)):
+					delta = -24 if event.button == 4 else 24
+					help_popup["scroll"] = max(0, help_popup.get("scroll", 0) + delta)
+					continue
 			elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
 				mx, my = event.pos
 				# close sell popup when clicking anywhere outside of it
@@ -477,7 +741,7 @@ def main():
 					restart_rect = pygame.Rect(mx0 + 360, my0 + 80, 140, 48)
 					if buy_rect.collidepoint((mx, my)):
 						# attempt buy slot
-						if currency >= slot_cost:
+						if currency >= slot_cost and unlocked_slots < MAX_SLOTS:
 							currency -= slot_cost
 							slots.append(Slot())
 							unlocked_slots += 1
@@ -504,6 +768,46 @@ def main():
 						last_gain = 0
 						continue
 				# otherwise normal click handling follows
+				# handle help popup first (blocks other UI) with defensive checks
+				if help_popup is not None:
+					try:
+						rrect = help_popup.get("rect") if isinstance(help_popup, dict) else None
+						crect = help_popup.get("close") if isinstance(help_popup, dict) else None
+						if rrect and rrect.collidepoint((mx, my)):
+							# if clicked the close button, close; otherwise keep open
+							if crect and crect.collidepoint((mx, my)):
+								help_popup = None
+							# keep open when clicking inside body
+						else:
+							# clicked outside popup -> close
+							help_popup = None
+						continue
+					except Exception:
+						print("Error handling help popup click:")
+						traceback.print_exc()
+						help_popup = None
+						continue
+				# handle prestige confirmation popup next (blocks other UI)
+				if prestige_popup:
+					if prestige_popup["rect"].collidepoint((mx, my)):
+						# Yes/No buttons
+						if prestige_popup["yes"].collidepoint((mx, my)):
+							# perform prestige
+							if unlocked_slots > INITIAL_SLOTS or currency >= 1000:
+								prestige_level += 1
+								prestige_mult = 1.0 + prestige_level * 0.1
+								currency = 0
+								slots = [Slot() for _ in range(INITIAL_SLOTS)]
+								unlocked_slots = INITIAL_SLOTS
+								last_gain = 0
+							# close popup after choice
+							prestige_popup = None
+						elif prestige_popup["no"].collidepoint((mx, my)):
+							prestige_popup = None
+					else:
+						# clicked outside popup -> close
+						prestige_popup = None
+					continue
 				# check for slot click to start dragging (priority)
 				clicked_slot = None
 				for i in range(len(slots)):
@@ -539,32 +843,53 @@ def main():
 					drag_pos = event.pos
 					continue
 				# UI handling
-				if btn_deal["rect"].collidepoint((mx, my)):
+				if btn_deal["rect"].collidepoint((mx, my)) and not worker_enabled:
 					now_click = pygame.time.get_ticks() / 1000.0
-					if now_click - last_deal_time >= deal_cooldown:
+					# use effective cooldown (reduced by Time Thief purchases)
+					eff_cd = effective_deal_cooldown()
+					if now_click - last_deal_time >= eff_cd:
 						# deal one coin per unlocked slot
 						for _ in range(unlocked_slots):
-							# spawn up to max_deal_level
-							lvl = weighted_random_coin(max_level=min(max_deal_level, unlocked_slots + 2))
+							# spawn up to max_deal_level (respect cap)
+							lvl = weighted_random_coin(slots, cap=min(max_deal_level, unlocked_slots + 2))
 							add_coin_to_slots(slots, lvl)
-						currency, last_gain = process_combines(slots, currency, prestige_mult)
+						# process combines but do NOT grant currency for deal-triggered combines
+						_ , _ = process_combines(slots, currency, prestige_mult)
+						last_gain = 0
 						last_deal_time = now_click
 					else:
 						# still cooling down; ignore click
 						pass
+				elif worker_owned and btn_worker_toggle["rect"].collidepoint((mx, my)):
+					worker_enabled = not worker_enabled
+					if worker_enabled:
+						worker_last_deal_time = pygame.time.get_ticks() / 1000.0
+					continue
 				elif btn_upgrades["rect"].collidepoint((mx, my)):
 					# open upgrades popup (contains Buy Slot and future upgrades)
 					if upgrades_popup:
 						upgrades_popup = None
 					else:
-						pw, ph = 260, 100
+						pw = 340
+						# define upgrade actions in an array so we can size the popup dynamically
+						actions = [
+							{"action": "buy_slot", "cost": slot_cost},
+							{"action": "buy_worker", "cost": WORKER_COST},
+							{"action": "buy_time_thief", "cost": TIME_THIEF_COST},
+							{"action": "noop", "cost": 0},
+						]
+						per_step = 32
+						top_pad = 8
+						bot_pad = 8
+						ph = top_pad + len(actions) * per_step + bot_pad
 						px = btn_upgrades["rect"].x
 						py = btn_upgrades["rect"].y - ph - 6
 						opts = []
-						# Buy Slot option
-						opts.append({"rect": pygame.Rect(px + 8, py + 8, pw - 16, 28), "action": "buy_slot", "cost": slot_cost})
-						# placeholder for future upgrades
-						opts.append({"rect": pygame.Rect(px + 8, py + 40, pw - 16, 28), "action": "noop", "cost": 0})
+						for i, a in enumerate(actions):
+							x = px + 8
+							y = py + top_pad + i * per_step
+							rect = pygame.Rect(x, y, pw - 16, 28)
+							opts.append({"rect": rect, "action": a["action"], "cost": a["cost"]})
 						upgrades_popup = {"rect": pygame.Rect(px, py, pw, ph), "options": opts}
 				elif btn_fullscreen["rect"].collidepoint((mx, my)):
 					# toggle fullscreen
@@ -574,32 +899,51 @@ def main():
 					else:
 						screen = pygame.display.set_mode((WIDTH, HEIGHT))
 				elif btn_prestige["rect"].collidepoint((mx, my)):
-					# simple prestige: require minimum currency and reset progress
+					# open a confirmation modal instead of immediate prestige
 					if unlocked_slots > INITIAL_SLOTS or currency >= 1000:
-						prestige_level += 1
-						prestige_mult = 1.0 + prestige_level * 0.1
-						currency = 0
-						slots = [Slot() for _ in range(INITIAL_SLOTS)]
-						unlocked_slots = INITIAL_SLOTS
+						pw, ph = 520, 160
+						mx0 = (WIDTH - pw) // 2
+						my0 = (HEIGHT - ph) // 2
+						yes_rect = pygame.Rect(mx0 + 60, my0 + 100, 160, 40)
+						no_rect = pygame.Rect(mx0 + 300, my0 + 100, 160, 40)
+						prestige_popup = {"rect": pygame.Rect(mx0, my0, pw, ph), "yes": yes_rect, "no": no_rect}
+				elif btn_help["rect"].collidepoint((mx, my)):
+					# toggle help modal
+					if help_popup:
+						help_popup = None
+					else:
+						pw, ph = 640, 360
+						mx0 = (WIDTH - pw) // 2
+						my0 = (HEIGHT - ph) // 2
+						close_rect = pygame.Rect(mx0 + pw - 120, my0 + ph - 52, 100, 40)
+						help_popup = {"rect": pygame.Rect(mx0, my0, pw, ph), "close": close_rect, "scroll": 0}
 				# Save/load handlers (separate from prestige)
 				elif btn_save["rect"].collidepoint((mx, my)):
 					save_path = os.path.join(os.path.dirname(__file__), "save.json")
-					saved = save_game(save_path, slots, unlocked_slots, currency, prestige_level)
+					saved = save_game(save_path, slots, unlocked_slots, currency, prestige_level, worker_owned, worker_enabled, time_thief_count)
 					# no blocking UI; last_gain used to show feedback
 					last_gain = 0 if saved else -1
 				elif btn_load["rect"].collidepoint((mx, my)):
 					save_path = os.path.join(os.path.dirname(__file__), "save.json")
 					data = load_game(save_path)
 					if data:
-						slots = [Slot() for _ in range(data.get("unlocked_slots", INITIAL_SLOTS))]
+						# clamp loaded unlocked_slots to MAX_SLOTS
+						loaded_slots = int(data.get("unlocked_slots", INITIAL_SLOTS))
+						loaded_slots = max(INITIAL_SLOTS, min(MAX_SLOTS, loaded_slots))
+						slots = [Slot() for _ in range(loaded_slots)]
 						for i, sdata in enumerate(data.get("slots", [])):
 							if i < len(slots):
 								slots[i].coin = sdata.get("coin", 0)
 								slots[i].count = sdata.get("count", 0)
-						unlocked_slots = data.get("unlocked_slots", INITIAL_SLOTS)
+						unlocked_slots = loaded_slots
 						currency = data.get("currency", 0)
 						prestige_level = data.get("prestige_level", 0)
 						prestige_mult = 1.0 + prestige_level * 0.1
+						# restore worker state if present
+						worker_owned = data.get("worker_owned", False)
+						worker_enabled = data.get("worker_enabled", False)
+						# restore Time Thief purchases if present
+						time_thief_count = data.get("time_thief_count", 0)
 				# Buy coin menu handling and sell-popup handling
 				else:
 					# Buy menu toggle
@@ -619,43 +963,53 @@ def main():
 								opts.append({"rect": rect, "level": lvl, "cost": coin_value(lvl)})
 							buy_popup = {"rect": pygame.Rect(px, py, pw, ph), "options": opts}
 						continue
-					# handle buy popup clicks
+					# handle buy popup clicks: keep it open after purchases; only close when clicking outside the popup
 					if buy_popup:
-						handled = False
-						for opt in buy_popup["options"]:
-							if opt["rect"].collidepoint((mx, my)):
-								lvl = opt["level"]
-								cost = opt["cost"]
-								if currency >= cost and lvl <= highest_purchasable:
-									currency -= cost
-									add_coin_to_slots(slots, lvl)
-									currency, last_gain = process_combines(slots, currency, prestige_mult)
-									handled = True
-									update_market_prices()
-									break
-						if handled:
-							buy_popup = None
+						# if click was inside the popup rect, handle option clicks but do not close
+						if buy_popup["rect"].collidepoint((mx, my)):
+							for opt in buy_popup["options"]:
+								if opt["rect"].collidepoint((mx, my)):
+									lvl = opt["level"]
+									cost = opt["cost"]
+									if currency >= cost and lvl <= highest_purchasable:
+										currency -= cost
+										add_coin_to_slots(slots, lvl)
+										currency, last_gain = process_combines(slots, currency, prestige_mult)
+										update_market_prices()
+						# if click was outside the popup, close it
 						else:
 							buy_popup = None
-					# handle upgrades popup clicks
+					# handle upgrades popup clicks: keep it open until clicking outside
 					if upgrades_popup:
-						handled_up = False
-						for opt in upgrades_popup["options"]:
-							if opt["rect"].collidepoint((mx, my)):
-								action = opt.get("action")
-								if action == "buy_slot":
-									cost = opt.get("cost", 0)
-									if currency >= cost:
-										currency -= cost
-										slots.append(Slot())
-										unlocked_slots += 1
-										handled_up = True
-										update_market_prices()
-								else:
-									handled_up = True
-								break
-						if handled_up:
-							upgrades_popup = None
+						# if click inside popup, process the clicked option but do not close the popup
+						if upgrades_popup["rect"].collidepoint((mx, my)):
+							for opt in upgrades_popup["options"]:
+								if opt["rect"].collidepoint((mx, my)):
+									action = opt.get("action")
+									if action == "buy_slot":
+										cost = opt.get("cost", 0)
+										if currency >= cost and unlocked_slots < MAX_SLOTS:
+											currency -= cost
+											slots.append(Slot())
+											unlocked_slots += 1
+											update_market_prices()
+									elif action == "buy_worker":
+										cost = opt.get("cost", 0)
+										if currency >= cost and not worker_owned:
+											currency -= cost
+											worker_owned = True
+											# enable worker immediately for convenience
+											worker_enabled = True
+											worker_last_deal_time = pygame.time.get_ticks() / 1000.0
+									elif action == "buy_time_thief":
+										cost = opt.get("cost", 0)
+										if currency >= cost and time_thief_count < max_time_thief_count():
+											currency -= cost
+											time_thief_count += 1
+									else:
+										pass
+									break
+						# if click was outside the popup, close it
 						else:
 							upgrades_popup = None
 					# handle sell popup clicks if present
@@ -799,32 +1153,40 @@ def main():
 					drag_pos = (0, 0)
 
 
+		# worker auto-deal: executes the same spawn/combine logic as the Deal button
+		now_worker = pygame.time.get_ticks() / 1000.0
+		if worker_owned and worker_enabled:
+			# worker uses the effective cooldown (Time Thief reduces both manual and worker speeds)
+			worker_interval = effective_deal_cooldown() * 2.0
+			if now_worker - worker_last_deal_time >= worker_interval:
+				for _ in range(unlocked_slots):
+						lvl = weighted_random_coin(slots, cap=min(max_deal_level, unlocked_slots + 2))
+						add_coin_to_slots(slots, lvl)
+						# worker deals should not directly award currency either
+						_ , _ = process_combines(slots, currency, prestige_mult)
+						last_gain = 0
+				worker_last_deal_time = now_worker
+				update_market_prices()
+
 		screen.fill((30, 30, 40))
 
-		# draw slots
-		slot_w = 140
-		slot_h = 140
-		margin = 20
-		start_x = 50
-		start_y = 50
+		# draw slots (use slot_rect so layout/wrapping is consistent)
 		for i, s in enumerate(slots):
-			x = start_x + (i % 8) * (slot_w + margin)
-			y = start_y + (i // 8) * (slot_h + margin)
-			rect = pygame.Rect(x, y, slot_w, slot_h)
+			rect = slot_rect(i)
 			color = (70, 70, 90) if i < unlocked_slots else (40, 40, 50)
 			pygame.draw.rect(screen, color, rect, border_radius=8)
 			pygame.draw.rect(screen, (120, 120, 140), rect, 2, border_radius=8)
 			if not s.is_empty():
 				# draw coin icon
 				surf = get_coin_surface(s.coin)
-				screen.blit(surf, (x + slot_w - surf.get_width() - 8, y + 8))
+				screen.blit(surf, (rect.x + rect.width - surf.get_width() - 8, rect.y + 8))
 				label = render_text(big_font, format_coin_label(s.coin), (240, 220, 180))
 				count_text = render_text(font, f"{s.count}/{SLOT_CAPACITY}", (200, 200, 200))
-				screen.blit(label, (x + 10, y + 10))
-				screen.blit(count_text, (x + 10, y + 36))
+				screen.blit(label, (rect.x + 10, rect.y + 10))
+				screen.blit(count_text, (rect.x + 10, rect.y + 36))
 			else:
 				label = render_text(font, "Empty", (140, 140, 160))
-				screen.blit(label, (x + 10, y + 10))
+				screen.blit(label, (rect.x + 10, rect.y + 10))
 
 		# draw UI area
 		def draw_btn(b, disabled=False):
@@ -885,22 +1247,40 @@ def main():
 		# draw main buttons, with disabled state when unaffordable (after chart so buttons are visible)
 		# draw Deal button; if cooling down show countdown as the label
 		now_draw = pygame.time.get_ticks() / 1000.0
-		remaining = max(0.0, deal_cooldown - (now_draw - last_deal_time))
-		if remaining > 0.0:
+		# manual remaining (use effective cooldown)
+		eff_cd = effective_deal_cooldown()
+		remaining_manual = max(0.0, eff_cd - (now_draw - last_deal_time))
+		# if worker is enabled, show worker countdown (worker uses double the manual cooldown)
+		if worker_enabled:
+			worker_interval = eff_cd * 2.0
+			remaining_worker = max(0.0, worker_interval - (now_draw - worker_last_deal_time))
 			orig_label = btn_deal["label"]
-			btn_deal["label"] = f"{remaining:.1f}s"
-			draw_btn(btn_deal)
+			btn_deal["label"] = f"{remaining_worker:.1f}s"
+			draw_btn(btn_deal, disabled=True)
 			btn_deal["label"] = orig_label
 		else:
-			draw_btn(btn_deal)
-			# ready indicator: green border around the button
-			pygame.draw.rect(screen, (60,200,80), btn_deal["rect"], 3, border_radius=6)
+			deal_disabled = remaining_manual > 0.0
+			if remaining_manual > 0.0:
+				orig_label = btn_deal["label"]
+				btn_deal["label"] = f"{remaining_manual:.1f}s"
+				draw_btn(btn_deal, disabled=False)
+				btn_deal["label"] = orig_label
+			else:
+				draw_btn(btn_deal, disabled=deal_disabled)
+				# ready indicator: green border around the button when manual deal is available
+				if not deal_disabled:
+					pygame.draw.rect(screen, (60,200,80), btn_deal["rect"], 3, border_radius=6)
 		draw_btn(btn_upgrades, disabled=(currency < slot_cost))
 		draw_btn(btn_prestige, disabled=(currency < 1000 and unlocked_slots==INITIAL_SLOTS))
 		draw_btn(btn_save)
 		draw_btn(btn_load)
 		draw_btn(btn_fullscreen)
+		draw_btn(btn_help)
 		draw_btn(btn_buy_menu)
+		# draw worker toggle when purchased
+		if worker_owned:
+			btn_worker_toggle["label"] = "Worker:On" if worker_enabled else "Worker:Off"
+			draw_btn(btn_worker_toggle)
 
 
 
@@ -920,6 +1300,17 @@ def main():
 			surf = render_text(small_font or font, t, (220, 220, 200))
 			screen.blit(surf, (hud_x + (i // 2) * 320, hud_y + (i % 2) * line_h))
 
+		# show indicator if low-level coins (1-3) cannot be placed anywhere
+		can_place_low = any(can_place_level(l) for l in range(1, 4))
+		warn_h = 0
+		if not can_place_low:
+			warn = "Low-level deals blocked — sell coins or buy slots to allow them."
+			ws = render_text_wrapped(small_font or font, warn, (240,140,40), 420)
+			warn_h = ws.get_height()
+			screen.blit(ws, (hud_x, hud_y + 2 * line_h + 6))
+
+		# (tooltip moved to Help menu)
+
 		# if no moves available, draw modal offering Buy Slot / Sell Coin / Restart
 		if no_moves:
 			modal_w, modal_h = 520, 160
@@ -934,7 +1325,8 @@ def main():
 			pygame.draw.rect(screen, (200, 200, 220), (mx0, my0, modal_w, modal_h), 2, border_radius=8)
 			msg = render_text(big_font or font, "No available moves", (230, 220, 200))
 			screen.blit(msg, (mx0 + 20, my0 + 20))
-			sub = render_text(small_font or font, "Buy a slot, sell a coin, or restart to continue.", (200, 200, 200))
+			text = "Buy a slot, sell a coin, or restart to continue."
+			sub = render_text_wrapped(small_font or font, text, (200, 200, 200), modal_w - 40)
 			screen.blit(sub, (mx0 + 20, my0 + 56))
 			# buttons
 			buy_rect = pygame.Rect(mx0 + 20, my0 + 80, 140, 48)
@@ -942,9 +1334,18 @@ def main():
 			restart_rect = pygame.Rect(mx0 + 360, my0 + 80, 140, 48)
 			# draw buttons
 			for r, lbl in ((buy_rect, "Buy Slot"), (sell_rect, "Sell Coin"), (restart_rect, "Restart")):
-				pygame.draw.rect(screen, (60, 100, 140), r, border_radius=6)
+				# special-case Buy Slot when we've hit the global slot cap
+				if lbl == "Buy Slot" and unlocked_slots >= MAX_SLOTS:
+					btn_bg = (48, 48, 64)
+					text_lbl = "Buy Slot (Maxed)"
+					text_col = (200, 200, 200)
+				else:
+					btn_bg = (60, 100, 140)
+					text_lbl = lbl
+					text_col = (255, 255, 255)
+				pygame.draw.rect(screen, btn_bg, r, border_radius=6)
 				pygame.draw.rect(screen, (200, 200, 220), r, 2, border_radius=6)
-				lsurf = render_text(small_font or font, lbl, (255, 255, 255))
+				lsurf = render_text(small_font or font, text_lbl, text_col)
 				screen.blit(lsurf, (r.x + (r.width - lsurf.get_width()) // 2, r.y + (r.height - lsurf.get_height()) // 2))
 
 		# draw popups (sell / buy / upgrades) after HUD/modal so they fully overlay other UI
@@ -973,8 +1374,10 @@ def main():
 				pygame.draw.rect(screen, bg, r, border_radius=4)
 				pygame.draw.rect(screen, (200,200,220), r, 1, border_radius=4)
 				lbl = f"Buy C{lvl} ({cost})"
-				ls = render_text(small_font or font, lbl, (200,200,200) if disabled else (255,255,255))
-				screen.blit(ls, (r.x + (r.width - ls.get_width())//2, r.y + (r.height - ls.get_height())//2))
+				wrap = render_text_wrapped(small_font or font, lbl, (200,200,200) if disabled else (255,255,255), r.width - 8)
+				x_off = r.x + max(0, (r.width - wrap.get_width())//2)
+				y_off = r.y + max(0, (r.height - wrap.get_height())//2)
+				screen.blit(wrap, (x_off, y_off))
 
 		if upgrades_popup:
 			r = upgrades_popup["rect"]
@@ -991,15 +1394,146 @@ def main():
 				action = opt.get("action")
 				cost = opt.get("cost", 0)
 				if action == "buy_slot":
-					lbl = f"Buy Slot ({cost})"
+					if unlocked_slots >= MAX_SLOTS:
+						lbl = "Buy Slot (Maxed)"
+						disabled = True
+					else:
+						lbl = f"Buy Slot ({cost})"
+						disabled = (currency < cost)
+				elif action == "buy_worker":
+					lbl = f"Worker ({cost})"
+					# disable if unaffordable or already owned
+					disabled = (currency < cost) or worker_owned
+				elif action == "buy_time_thief":
+					max_tt = max_time_thief_count()
+					lbl = f"Time Thief x{time_thief_count}/{max_tt} ({cost})"
+					# disable if unaffordable or already at max
+					disabled = (currency < cost) or (time_thief_count >= max_tt)
 				else:
 					lbl = "More..."
-				disabled = (currency < cost) and action == "buy_slot"
+					disabled = False
 				bg = (64,64,74) if disabled else (70,120,180)
 				pygame.draw.rect(screen, bg, r2, border_radius=4)
 				pygame.draw.rect(screen, (200,200,220), r2, 1, border_radius=4)
-				ls = render_text(small_font or font, lbl, (200,200,200) if disabled else (255,255,255))
-				screen.blit(ls, (r2.x + 8, r2.y + (r2.height - ls.get_height())//2))
+				wrap = render_text_wrapped(small_font or font, lbl, (200,200,200) if disabled else (255,255,255), r2.width - 16)
+				y_off = r2.y + max(0, (r2.height - wrap.get_height())//2)
+				screen.blit(wrap, (r2.x + 8, y_off))
+
+		if prestige_popup:
+			# dim background
+			over = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+			over.fill((0, 0, 0, 160))
+			screen.blit(over, (0, 0))
+			r = prestige_popup["rect"]
+			pygame.draw.rect(screen, (40, 40, 50), (r.x, r.y, r.width, r.height), border_radius=8)
+			pygame.draw.rect(screen, (200,200,220), (r.x, r.y, r.width, r.height), 2, border_radius=8)
+			msg = render_text(big_font or font, "Prestige Reset?", (230,220,200))
+			sub_text = "Reset progress for a prestige bonus? This cannot be undone."
+			sub = render_text_wrapped(small_font or font, sub_text, (200,200,200), r.width - 40)
+			screen.blit(msg, (r.x + 20, r.y + 12))
+			screen.blit(sub, (r.x + 20, r.y + 52))
+			# draw buttons
+			y = prestige_popup["yes"]
+			n = prestige_popup["no"]
+			pygame.draw.rect(screen, (60,100,140), y, border_radius=6)
+			pygame.draw.rect(screen, (200,200,220), y, 2, border_radius=6)
+			pygame.draw.rect(screen, (100,60,60), n, border_radius=6)
+			pygame.draw.rect(screen, (200,200,220), n, 2, border_radius=6)
+			ys = render_text(small_font or font, "Yes, I'm sure", (255,255,255))
+			ns = render_text(small_font or font, "No, not yet", (255,255,255))
+			screen.blit(ys, (y.x + (y.width - ys.get_width())//2, y.y + (y.height - ys.get_height())//2))
+			screen.blit(ns, (n.x + (n.width - ns.get_width())//2, n.y + (n.height - ns.get_height())//2))
+
+		if help_popup:
+			# dim background
+			over = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+			over.fill((0, 0, 0, 160))
+			screen.blit(over, (0, 0))
+			r = help_popup["rect"]
+			pygame.draw.rect(screen, (36,36,44), (r.x, r.y, r.width, r.height), border_radius=8)
+			pygame.draw.rect(screen, (200,200,220), (r.x, r.y, r.width, r.height), 2, border_radius=8)
+			# title
+			title = render_text(big_font or font, "Help & Mechanics", (230,220,200))
+			screen.blit(title, (r.x + 20, r.y + 12))
+			# neat, short bullets for mechanics
+			lines = [
+				"- Deals create coins only (one per unlocked slot).",
+				"- Sell coins to earn currency (sell popup).",
+				"- Worker auto-deals every 2x manual cooldown when enabled.",
+				"- Time Thief reduces cooldowns (min enforced).",
+				f"- Slots cap at {MAX_SLOTS}; slot capacity = {SLOT_CAPACITY}.",
+				"",
+				"Spawn probabilities (current):",
+			]
+			# compute spawn probs with the same cap used for deals
+			prob_cap = min(max(3, max((s.coin for s in slots), default=0) + 1), unlocked_slots + 2)
+			probs = compute_spawn_probabilities(slots, cap=prob_cap)
+			for lvl in sorted(probs.keys()):
+				lines.append(f"  C{lvl}: {probs[lvl]:.1f}%")
+
+			# Render all lines onto a clipped content surface so text never escapes the popup
+			content_x = r.x + 20
+			content_w = r.width - 40
+			content_y = r.y + 56
+			# prepare rendered line surfaces (wrapped to content width)
+			line_surfs = []
+			for ln in lines:
+				sur = render_text_wrapped(small_font or font, ln, (200,200,200), content_w)
+				line_surfs.append(sur)
+			# total height of content
+			total_h = sum(s.get_height() for s in line_surfs) + max(0, (len(line_surfs) - 1) * 8)
+			max_content_h = r.height - (content_y - r.y) - 20
+			if max_content_h < 1:
+				max_content_h = 1
+			# create a full content surface and blit all lines so we can scroll a viewport over it
+			full_content_surf = pygame.Surface((content_w, max(1, total_h)), pygame.SRCALPHA)
+			yi = 0
+			for s in line_surfs:
+				full_content_surf.blit(s, (0, yi))
+				yi += s.get_height() + 8
+			# visible viewport height inside popup
+			visible_h = max(1, r.height - (content_y - r.y) - 20)
+			# clamp scroll and compute viewport rect safely so it never exceeds the content surface
+			scroll = int(help_popup.get("scroll", 0)) if isinstance(help_popup, dict) else 0
+			# viewport height must not exceed full content height
+			viewport_h = min(visible_h, full_content_surf.get_height())
+			max_scroll = max(0, full_content_surf.get_height() - viewport_h)
+			if scroll < 0:
+				scroll = 0
+			if scroll > max_scroll:
+				scroll = max_scroll
+			# blit visible region (safe subsurface)
+			viewport = pygame.Rect(0, scroll, content_w, viewport_h)
+			# when content is smaller than visible area, blit the whole content and leave remaining area empty
+			if viewport_h <= 0:
+				# nothing to blit
+				pass
+			else:
+				try:
+					screen.blit(full_content_surf.subsurface(viewport), (content_x, content_y))
+				except ValueError:
+					# fallback: blit as much as possible without using subsurface
+					screen.blit(full_content_surf, (content_x, content_y))
+			# draw a simple scrollbar if content overflows
+			if full_content_surf.get_height() > visible_h:
+				sb_x = content_x + content_w + 6
+				sb_w = 8
+				ratio = visible_h / full_content_surf.get_height()
+				bar_h = max(int(visible_h * ratio), 8)
+				if max_scroll > 0:
+					bar_y = content_y + int((scroll / max_scroll) * (visible_h - bar_h))
+				else:
+					bar_y = content_y
+				# draw track
+				pygame.draw.rect(screen, (60,60,70), (sb_x, content_y, sb_w, visible_h), border_radius=4)
+				# draw thumb
+				pygame.draw.rect(screen, (140,140,160), (sb_x, bar_y, sb_w, bar_h), border_radius=4)
+			# close button
+			cr = help_popup["close"]
+			pygame.draw.rect(screen, (60,100,140), cr, border_radius=6)
+			pygame.draw.rect(screen, (200,200,220), cr, 2, border_radius=6)
+			cs = render_text(small_font or font, "Close", (255,255,255))
+			screen.blit(cs, (cr.x + (cr.width - cs.get_width())//2, cr.y + (cr.height - cs.get_height())//2))
 
 		pygame.display.flip()
 
@@ -1013,13 +1547,16 @@ def main():
 	sys.exit()
 
 
-def save_game(path, slots, unlocked_slots, currency, prestige_level):
+def save_game(path, slots, unlocked_slots, currency, prestige_level, worker_owned=False, worker_enabled=False, time_thief_count=0):
 	try:
 		data = {
 			"slots": [{"coin": s.coin, "count": s.count} for s in slots],
 			"unlocked_slots": unlocked_slots,
 			"currency": currency,
 			"prestige_level": prestige_level,
+			"worker_owned": bool(worker_owned),
+			"worker_enabled": bool(worker_enabled),
+			"time_thief_count": int(time_thief_count),
 		}
 		with open(path, "w") as f:
 			json.dump(data, f)

@@ -31,6 +31,8 @@ TIME_THIEF_COST = 500
 TIME_THIEF_REDUCTION = 0.25  # seconds reduced per Time Thief purchased
 # minimum possible manual deal cooldown (player-controlled)
 MIN_DEAL_COOLDOWN = 0.25
+# Worker upgrade cost: after max Time Thiefs, buy to make worker use same cooldown as manual
+WORKER_UPGRADE_COST = 7500
 DEAL_WEIGHT_DECAY = 2.0  # decay factor for deal weighting: higher -> stronger bias to small coins
 # UI layout limits
 MAX_SLOTS_PER_ROW = 6
@@ -111,6 +113,11 @@ BITMAP_FONT = {
 	",": [0x00,0x00,0x00,0x00,0x00,0x04,0x08],
 	";": [0x00,0x18,0x18,0x00,0x00,0x04,0x08],
 	"=": [0x00,0x00,0x00,0x1F,0x00,0x1F,0x00],
+	"+": [0x04,0x04,0x04,0x1F,0x04,0x04,0x04],
+	"<": [0x00,0x04,0x02,0x01,0x02,0x04,0x00],
+	">": [0x00,0x02,0x04,0x08,0x04,0x02,0x00],
+	"←": [0x00,0x02,0x04,0x1F,0x04,0x02,0x00],
+	"→": [0x00,0x08,0x04,0x1F,0x04,0x08,0x00],
 	}
 
 
@@ -328,7 +335,7 @@ def weighted_random_coin(*args, **kwargs):
 
 
 def compute_spawn_probabilities(slots, cap=None):
-	"""Return a dict level->percent for spawn probabilities given current slots.
+	"""Return a dict level → percent for spawn probabilities given current slots.
 	Mirrors the selection logic used by weighted_random_coin for the slots case.
 	"""
 	present = {s.coin for s in slots if s.coin}
@@ -514,6 +521,9 @@ def main():
 
 	# Time Thief upgrade state (reduces cooldowns)
 	time_thief_count = 0
+
+	# Worker upgrade state: when True, worker uses same cooldown as manual (not 2x)
+	worker_upgraded = False
 
 	# dragging state
 	dragging = False
@@ -709,6 +719,39 @@ def main():
 		for event in pygame.event.get():
 			if event.type == pygame.QUIT:
 				running = False
+			elif event.type == pygame.KEYDOWN:
+				# Toggle help with H key (same as clicking Help button)
+				if event.key == pygame.K_h:
+					if help_popup:
+						help_popup = None
+					else:
+						pw, ph = 640, 360
+						mx0 = (WIDTH - pw) // 2
+						my0 = (HEIGHT - ph) // 2
+						close_rect = pygame.Rect(mx0 + pw - 120, my0 + ph - 52, 100, 40)
+						help_popup = {"rect": pygame.Rect(mx0, my0, pw, ph), "close": close_rect, "scroll": 0}
+					continue
+				# Space triggers Deal (same as clicking Deal), unless Worker is enabled
+				elif event.key == pygame.K_SPACE:
+					if worker_enabled or help_popup:
+						# ignore space while worker auto-deal is active or Help open
+						continue
+					now_click = pygame.time.get_ticks() / 1000.0
+					# use effective cooldown (reduced by Time Thief purchases)
+					eff_cd = effective_deal_cooldown()
+					if now_click - last_deal_time >= eff_cd:
+						# deal one coin per unlocked slot
+						for _ in range(unlocked_slots):
+							lvl = weighted_random_coin(slots, cap=min(max_deal_level, unlocked_slots + 2))
+							add_coin_to_slots(slots, lvl)
+						# process combines but do NOT grant currency for deal-triggered combines
+						_ , _ = process_combines(slots, currency, prestige_mult)
+						last_gain = 0
+						last_deal_time = now_click
+					else:
+						# still cooling down; ignore
+						pass
+					continue
 			elif event.type == pygame.MOUSEWHEEL:
 				# scroll help popup content when wheel used over the popup
 				if help_popup and isinstance(help_popup, dict):
@@ -818,6 +861,25 @@ def main():
 				# Shift+click opens sell popup for that slot
 				mods = pygame.key.get_mods()
 				if clicked_slot is not None and not dragging:
+					# Ctrl+Click: quick-sell one from the stack
+					if mods & pygame.KMOD_CTRL:
+						# perform the same action as the sell-popup "Sell 1": apply current market price and impact
+						lvl = slots[clicked_slot].coin
+						price = current_prices.get(lvl, coin_value(lvl))
+						if slots[clicked_slot].count > 0:
+							slots[clicked_slot].count -= 1
+							if slots[clicked_slot].count == 0:
+								slots[clicked_slot].coin = 0
+							currency += price
+							# record sale impact on market history/timestamps
+							for _ in range(SELL_IMPACT_MULTIPLIER):
+								market_sales_history[lvl].append(price)
+								_market_now = pygame.time.get_ticks() / 1000.0
+								for _ in range(SELL_IMPACT_MULTIPLIER):
+									market_sales_timestamps[lvl].append(_market_now)
+							# update market prices after sale
+							update_market_prices()
+						continue
 					if mods & pygame.KMOD_SHIFT:
 						lvl = slots[clicked_slot].coin
 						# popup near slot (larger so value text and buttons don't overlap)
@@ -875,6 +937,7 @@ def main():
 						actions = [
 							{"action": "buy_slot", "cost": slot_cost},
 							{"action": "buy_worker", "cost": WORKER_COST},
+							{"action": "buy_worker_upgrade", "cost": WORKER_UPGRADE_COST},
 							{"action": "buy_time_thief", "cost": TIME_THIEF_COST},
 							{"action": "noop", "cost": 0},
 						]
@@ -920,7 +983,7 @@ def main():
 				# Save/load handlers (separate from prestige)
 				elif btn_save["rect"].collidepoint((mx, my)):
 					save_path = os.path.join(os.path.dirname(__file__), "save.json")
-					saved = save_game(save_path, slots, unlocked_slots, currency, prestige_level, worker_owned, worker_enabled, time_thief_count)
+					saved = save_game(save_path, slots, unlocked_slots, currency, prestige_level, worker_owned, worker_enabled, time_thief_count, worker_upgraded)
 					# no blocking UI; last_gain used to show feedback
 					last_gain = 0 if saved else -1
 				elif btn_load["rect"].collidepoint((mx, my)):
@@ -942,6 +1005,7 @@ def main():
 						# restore worker state if present
 						worker_owned = data.get("worker_owned", False)
 						worker_enabled = data.get("worker_enabled", False)
+						worker_upgraded = data.get("worker_upgraded", False)
 						# restore Time Thief purchases if present
 						time_thief_count = data.get("time_thief_count", 0)
 				# Buy coin menu handling and sell-popup handling
@@ -1001,6 +1065,12 @@ def main():
 											# enable worker immediately for convenience
 											worker_enabled = True
 											worker_last_deal_time = pygame.time.get_ticks() / 1000.0
+									elif action == "buy_worker_upgrade":
+										cost = opt.get("cost", 0)
+										# can only buy the worker upgrade if player owns the worker and has maxed Time Thiefs
+										if currency >= cost and worker_owned and not worker_upgraded and time_thief_count >= max_time_thief_count():
+											currency -= cost
+											worker_upgraded = True
 									elif action == "buy_time_thief":
 										cost = opt.get("cost", 0)
 										if currency >= cost and time_thief_count < max_time_thief_count():
@@ -1155,9 +1225,10 @@ def main():
 
 		# worker auto-deal: executes the same spawn/combine logic as the Deal button
 		now_worker = pygame.time.get_ticks() / 1000.0
-		if worker_owned and worker_enabled:
+		if worker_owned and worker_enabled and not help_popup:
 			# worker uses the effective cooldown (Time Thief reduces both manual and worker speeds)
-			worker_interval = effective_deal_cooldown() * 2.0
+			worker_multiplier = 1.0 if worker_upgraded else 2.0
+			worker_interval = effective_deal_cooldown() * worker_multiplier
 			if now_worker - worker_last_deal_time >= worker_interval:
 				for _ in range(unlocked_slots):
 						lvl = weighted_random_coin(slots, cap=min(max_deal_level, unlocked_slots + 2))
@@ -1252,7 +1323,8 @@ def main():
 		remaining_manual = max(0.0, eff_cd - (now_draw - last_deal_time))
 		# if worker is enabled, show worker countdown (worker uses double the manual cooldown)
 		if worker_enabled:
-			worker_interval = eff_cd * 2.0
+			worker_multiplier = 1.0 if worker_upgraded else 2.0
+			worker_interval = eff_cd * worker_multiplier
 			remaining_worker = max(0.0, worker_interval - (now_draw - worker_last_deal_time))
 			orig_label = btn_deal["label"]
 			btn_deal["label"] = f"{remaining_worker:.1f}s"
@@ -1409,6 +1481,11 @@ def main():
 					lbl = f"Time Thief x{time_thief_count}/{max_tt} ({cost})"
 					# disable if unaffordable or already at max
 					disabled = (currency < cost) or (time_thief_count >= max_tt)
+				elif action == "buy_worker_upgrade":
+					# only show the upgrade when it's relevant; display counts & disable otherwise
+					lbl = f"Worker Upgrade ({cost})"
+					# disabled if unaffordable, worker not owned, already upgraded, or Time Thiefs not maxed
+					disabled = (currency < cost) or (not worker_owned) or worker_upgraded or (time_thief_count < max_time_thief_count())
 				else:
 					lbl = "More..."
 					disabled = False
@@ -1455,17 +1532,27 @@ def main():
 			# title
 			title = render_text(big_font or font, "Help & Mechanics", (230,220,200))
 			screen.blit(title, (r.x + 20, r.y + 12))
-			# neat, short bullets for mechanics
+			# build help lines including recent features and keybindings
+			max_tt = max_time_thief_count()
 			lines = [
-				"- Deals create coins only (one per unlocked slot).",
-				"- Sell coins to earn currency (sell popup).",
-				"- Worker auto-deals every 2x manual cooldown when enabled.",
-				"- Time Thief reduces cooldowns (min enforced).",
-				f"- Slots cap at {MAX_SLOTS}; slot capacity = {SLOT_CAPACITY}.",
+				"- Deals spawn coins only (one per unlocked slot).",
+				"- Selling coins opens the sell popup and grants currency.",
+				f"- Worker: buy for {WORKER_COST} and toggle On/Off; when enabled it auto-deals every 2x manual cooldown by default.",
+				f"- Worker Upgrade: available after buying {max_tt} Time Thiefs; cost = {WORKER_UPGRADE_COST}; makes the worker use the same cooldown as manual.",
+				f"- Time Thief: cost = {TIME_THIEF_COST}; each reduces the manual deal cooldown by {TIME_THIEF_REDUCTION:.2f}s (min {MIN_DEAL_COOLDOWN:.2f}s).",
+				"- Worker deals do not directly award currency; sell coins to realize value.",
+				"",
+				"Controls:",
+				"  - Press H to open/close this Help window (Help pauses worker and blocks Space).",
+				"  - Press Space to perform a Manual Deal (disabled while Worker is enabled or Help is open).",
+				"  - Ctrl+Click a slot to instantly sell 1 (identical to Sell → 1).",
+				"",
+				"Flow: Deal → Combine → Sell (sell to convert coins into currency).",
+				f"Slots: max {MAX_SLOTS}; per-slot capacity = {SLOT_CAPACITY}.",
 				"",
 				"Spawn probabilities (current):",
 			]
-			# compute spawn probs with the same cap used for deals
+			# compute spawn probs with same cap used for deals
 			prob_cap = min(max(3, max((s.coin for s in slots), default=0) + 1), unlocked_slots + 2)
 			probs = compute_spawn_probabilities(slots, cap=prob_cap)
 			for lvl in sorted(probs.keys()):
@@ -1547,7 +1634,7 @@ def main():
 	sys.exit()
 
 
-def save_game(path, slots, unlocked_slots, currency, prestige_level, worker_owned=False, worker_enabled=False, time_thief_count=0):
+def save_game(path, slots, unlocked_slots, currency, prestige_level, worker_owned=False, worker_enabled=False, time_thief_count=0, worker_upgraded=False):
 	try:
 		data = {
 			"slots": [{"coin": s.coin, "count": s.count} for s in slots],
@@ -1557,6 +1644,7 @@ def save_game(path, slots, unlocked_slots, currency, prestige_level, worker_owne
 			"worker_owned": bool(worker_owned),
 			"worker_enabled": bool(worker_enabled),
 			"time_thief_count": int(time_thief_count),
+			"worker_upgraded": bool(worker_upgraded),
 		}
 		with open(path, "w") as f:
 			json.dump(data, f)

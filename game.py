@@ -93,6 +93,10 @@ BITMAP_FONT = {
 	"/": [0x01,0x02,0x04,0x08,0x10,0x00,0x00],
 	"?": [0x0E,0x11,0x01,0x06,0x04,0x00,0x04],
 	"%": [0x18,0x19,0x02,0x04,0x08,0x13,0x03],
+	"(": [0x02,0x04,0x08,0x08,0x08,0x04,0x02],
+	")": [0x08,0x04,0x02,0x02,0x02,0x04,0x08],
+	".": [0x00,0x00,0x00,0x00,0x00,0x04,0x04],
+	",": [0x00,0x00,0x00,0x00,0x00,0x04,0x08],
 }
 
 
@@ -243,6 +247,14 @@ def main():
 			big_font = None
 			small_font = None
 
+	# additional font sizes used elsewhere
+	try:
+		small_font = _pygame_font.SysFont(None, 14) if HAVE_PYGAME_FONT else None
+		big_font = _pygame_font.SysFont(None, 28) if HAVE_PYGAME_FONT else None
+	except Exception:
+		small_font = None
+		big_font = None
+
 	def render_text(f, text, color=(255, 255, 255)):
 		# if a pygame font backend is available, use it; otherwise fallback to bitmap
 		if f is None:
@@ -282,7 +294,7 @@ def main():
 	# game state
 	slots = [Slot() for _ in range(INITIAL_SLOTS)]
 	unlocked_slots = INITIAL_SLOTS
-	currency = 0
+	currency = 2500
 	prestige_mult = 1.0
 	prestige_level = 0
 
@@ -373,6 +385,9 @@ def main():
 			if len(price_history[lvl]) > price_history_max:
 				price_history[lvl].pop(0)
 
+	# misc UI/game flags
+	no_moves = False
+	highest_purchasable = 3
 
 	def slot_rect(index):
 		slot_w = 140
@@ -1026,4 +1041,3 @@ def load_game(path):
 
 if __name__ == "__main__":
 	main()
-

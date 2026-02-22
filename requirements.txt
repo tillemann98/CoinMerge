@@ -1,1 +1,2 @@
-pygame>=2.1.0,<3.0.0
+# Recommended Pygame version (tested with 2.6.x). Keep below 3.0.
+pygame>=2.6.0,<3.0.0

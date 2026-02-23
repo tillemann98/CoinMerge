@@ -482,6 +482,100 @@ def main():
 			out.blit(s, (0, y))
 			y += s.get_height() + line_spacing
 		return out
+
+	# Draw the help popup (can be called from menu or game rendering)
+	def render_help_popup(hp):
+		if not hp:
+			return
+		r = hp.get("rect") if isinstance(hp, dict) else None
+		if r is None:
+			return
+		# dim background
+		over = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+		over.fill((0, 0, 0, 160))
+		screen.blit(over, (0, 0))
+		pygame.draw.rect(screen, (36,36,44), (r.x, r.y, r.width, r.height), border_radius=8)
+		pygame.draw.rect(screen, (200,200,220), (r.x, r.y, r.width, r.height), 2, border_radius=8)
+		# title
+		title = render_text(big_font or font, "Help & Mechanics", (230,220,200))
+		screen.blit(title, (r.x + 20, r.y + 12))
+		# build help lines (same as in main help code)
+		max_tt = max_time_thief_count()
+		lines = [
+			"- Deals spawn coins only (one per unlocked slot).",
+			"- Selling coins opens the sell popup and grants currency.",
+			f"- Worker: buy for {WORKER_COST} and toggle On/Off; when enabled it auto-deals every 2x manual cooldown by default.",
+			f"- Worker Upgrade: available after buying {max_tt} Time Thiefs; cost = {WORKER_UPGRADE_COST}; makes the worker use the same cooldown as manual.",
+			f"- Time Thief: cost = {TIME_THIEF_COST}; each reduces the manual deal cooldown by {TIME_THIEF_REDUCTION:.2f}s (min {MIN_DEAL_COOLDOWN:.2f}s).",
+			"- Worker deals do not directly award currency; sell coins to realize value.",
+			"",
+			"Controls:",
+			"  - Press H to open/close this Help window (Help pauses worker and blocks Space).",
+			"  - Press Space to perform a Manual Deal (disabled while Worker is enabled or Help is open).",
+			"  - Ctrl+Click a slot to instantly sell 1 (identical to Sell -> 1).",
+			"",
+			f"Flow: Deal → Combine → Sell (sell to convert coins into currency).",
+			f"Slots: max {MAX_SLOTS}; per-slot capacity = {SLOT_CAPACITY}.",
+			"",
+			"Spawn probabilities (current):",
+		]
+		prob_cap = min(max(3, max((s.coin for s in slots), default=0) + 1), unlocked_slots + 2)
+		probs = compute_spawn_probabilities(slots, cap=prob_cap)
+		for lvl in sorted(probs.keys()):
+			lines.append(f"  C{lvl}: {probs[lvl]:.1f}%")
+
+		# Render wrapped lines into a content surface and blit viewport
+		content_x = r.x + 20
+		content_w = r.width - 40
+		content_y = r.y + 56
+		line_surfs = []
+		for ln in lines:
+			sur = render_text_wrapped(small_font or font, ln, (200,200,200), content_w)
+			line_surfs.append(sur)
+		total_h = sum(s.get_height() for s in line_surfs) + max(0, (len(line_surfs) - 1) * 8)
+		max_content_h = r.height - (content_y - r.y) - 20
+		if max_content_h < 1:
+			max_content_h = 1
+		full_content_surf = pygame.Surface((content_w, max(1, total_h)), pygame.SRCALPHA)
+		yi = 0
+		for s in line_surfs:
+			full_content_surf.blit(s, (0, yi))
+			yi += s.get_height() + 8
+		visible_h = max(1, r.height - (content_y - r.y) - 20)
+		scroll = int(hp.get("scroll", 0)) if isinstance(hp, dict) else 0
+		viewport_h = min(visible_h, full_content_surf.get_height())
+		max_scroll = max(0, full_content_surf.get_height() - viewport_h)
+		if scroll < 0:
+			scroll = 0
+		if scroll > max_scroll:
+			scroll = max_scroll
+		viewport = pygame.Rect(0, scroll, content_w, viewport_h)
+		if viewport_h > 0:
+			try:
+				screen.blit(full_content_surf.subsurface(viewport), (content_x, content_y))
+			except ValueError:
+				screen.blit(full_content_surf, (content_x, content_y))
+
+		# draw scrollbar if needed
+		if full_content_surf.get_height() > visible_h:
+			sb_x = content_x + content_w + 6
+			sb_w = 8
+			ratio = visible_h / full_content_surf.get_height()
+			bar_h = max(int(visible_h * ratio), 8)
+			if max_scroll > 0:
+				bar_y = content_y + int((scroll / max_scroll) * (visible_h - bar_h))
+			else:
+				bar_y = content_y
+			pygame.draw.rect(screen, (60,60,70), (sb_x, content_y, sb_w, visible_h), border_radius=4)
+			pygame.draw.rect(screen, (140,140,160), (sb_x, bar_y, sb_w, bar_h), border_radius=4)
+
+		# close button
+		cr = hp.get("close") if isinstance(hp, dict) else None
+		if cr:
+			pygame.draw.rect(screen, (60,100,140), cr, border_radius=6)
+			pygame.draw.rect(screen, (200,200,220), cr, 2, border_radius=6)
+			cs = render_text(small_font or font, "Close", (255,255,255))
+			screen.blit(cs, (cr.x + (cr.width - cs.get_width())//2, cr.y + (cr.height - cs.get_height())//2))
 	# UI buttons
 	btn_deal = make_button((50, 600, 160, 40), "Deal Coins")
 	btn_buy_slot = make_button((230, 600, 160, 40), "Buy Slot")
@@ -503,9 +597,15 @@ def main():
 	btn_help = make_button((480, 650, 120, 34), "Help")
 	# place worker toggle in a third row (compact) to avoid overlapping chart
 	btn_worker_toggle = make_button((20, 694, 140, 24), "Worker:Off")
+	# main menu buttons (used on startup)
+	btn_menu_new = make_button(((WIDTH//2 - 120), 240, 240, 48), "New Game")
+	btn_menu_load = make_button(((WIDTH//2 - 120), 308, 240, 48), "Load Save")
+	btn_menu_help = make_button(((WIDTH//2 - 120), 376, 240, 48), "Help")
+	btn_menu_exit = make_button(((WIDTH//2 - 120), 444, 240, 48), "Exit")
 	buy_popup = None  # {'rect':Rect, 'options':[{'rect':Rect,'level':int,'cost':int}]}
 	upgrades_popup = None
 	prestige_popup = None
+	exit_menu_popup = None
 	help_popup = None
 
 	# game state
@@ -679,6 +779,120 @@ def main():
 	while running:
 		dt = clock.tick(60) / 1000.0
 
+		# --- Main menu handling: process events and draw menu, skipping gameplay while active ---
+		if 'menu_active' not in locals():
+			menu_active = True
+		if menu_active:
+			for event in pygame.event.get():
+				if event.type == pygame.QUIT:
+					running = False
+					break
+				elif event.type == pygame.KEYDOWN:
+					if event.key == pygame.K_h:
+						# toggle help popup while in menu
+						if help_popup:
+							help_popup = None
+						else:
+							pw, ph = 640, 360
+							mx0 = (WIDTH - pw) // 2
+							my0 = (HEIGHT - ph) // 2
+							close_rect = pygame.Rect(mx0 + pw - 120, my0 + ph - 52, 100, 40)
+							help_popup = {"rect": pygame.Rect(mx0, my0, pw, ph), "close": close_rect, "scroll": 0}
+						continue
+				elif event.type == pygame.MOUSEWHEEL:
+					# allow scrolling the help popup while in menu
+					if help_popup and isinstance(help_popup, dict):
+						mx, my = pygame.mouse.get_pos()
+						if help_popup["rect"].collidepoint((mx, my)):
+							delta = -event.y * 24
+							help_popup["scroll"] = max(0, help_popup.get("scroll", 0) + delta)
+							continue
+					# otherwise fall through
+				elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+					mx, my = event.pos
+					# if help popup is open, handle clicks for closing/keeping it
+					if help_popup and isinstance(help_popup, dict):
+						try:
+							rrect = help_popup.get("rect")
+							crect = help_popup.get("close")
+							if rrect and rrect.collidepoint((mx, my)):
+								# clicked inside help popup; if clicked the close button, close; otherwise keep open
+								if crect and crect.collidepoint((mx, my)):
+									help_popup = None
+								# keep open when clicking inside body
+							else:
+								# clicked outside popup -> close
+								help_popup = None
+							# consume the click
+							continue
+						except Exception:
+							print("Error handling help popup click in menu:")
+							traceback.print_exc()
+							help_popup = None
+							continue
+					if btn_menu_new["rect"].collidepoint((mx, my)):
+						# start a fresh game
+						slots = [Slot() for _ in range(INITIAL_SLOTS)]
+						unlocked_slots = INITIAL_SLOTS
+						currency = 2500
+						prestige_mult = 1.0
+						prestige_level = 0
+						worker_owned = False
+						worker_enabled = False
+						worker_last_deal_time = pygame.time.get_ticks() / 1000.0
+						time_thief_count = 0
+						worker_upgraded = False
+						menu_active = False
+						continue
+					if btn_menu_load["rect"].collidepoint((mx, my)):
+						# load from save if present
+						save_path = os.path.join(os.path.dirname(__file__), "save.json")
+						data = load_game(save_path)
+						if data:
+							loaded_slots = int(data.get("unlocked_slots", INITIAL_SLOTS))
+							loaded_slots = max(INITIAL_SLOTS, min(MAX_SLOTS, loaded_slots))
+							slots = [Slot() for _ in range(loaded_slots)]
+							for i, sdata in enumerate(data.get("slots", [])):
+								if i < len(slots):
+									slots[i].coin = sdata.get("coin", 0)
+									slots[i].count = sdata.get("count", 0)
+							unlocked_slots = loaded_slots
+							currency = data.get("currency", 0)
+							prestige_level = data.get("prestige_level", 0)
+							prestige_mult = 1.0 + prestige_level * 0.1
+							worker_owned = data.get("worker_owned", False)
+							worker_enabled = data.get("worker_enabled", False)
+							worker_upgraded = data.get("worker_upgraded", False)
+							time_thief_count = data.get("time_thief_count", 0)
+							menu_active = False
+						continue
+					if btn_menu_help["rect"].collidepoint((mx, my)):
+						pw, ph = 640, 360
+						mx0 = (WIDTH - pw) // 2
+						my0 = (HEIGHT - ph) // 2
+						close_rect = pygame.Rect(mx0 + pw - 120, my0 + ph - 52, 100, 40)
+						help_popup = {"rect": pygame.Rect(mx0, my0, pw, ph), "close": close_rect, "scroll": 0}
+						continue
+					if btn_menu_exit["rect"].collidepoint((mx, my)):
+						running = False
+						break
+
+			# draw menu
+			screen.fill((24, 24, 30))
+			title = render_text(big_font or font, "Combiner — Main Menu", (230,220,200))
+			screen.blit(title, ((WIDTH - title.get_width())//2, 140))
+			# draw buttons
+			for b in (btn_menu_new, btn_menu_load, btn_menu_help, btn_menu_exit):
+				pygame.draw.rect(screen, (60,100,140), b["rect"], border_radius=8)
+				pygame.draw.rect(screen, (200,200,220), b["rect"], 2, border_radius=8)
+				lbl = render_text(small_font or font, b["label"], (255,255,255))
+				screen.blit(lbl, (b["rect"].x + (b["rect"].width - lbl.get_width())//2, b["rect"].y + (b["rect"].height - lbl.get_height())//2))
+			# if help is open, let the later Help rendering code draw it (we still call flip here to remain responsive)
+			if help_popup:
+				render_help_popup(help_popup)
+			pygame.display.flip()
+			continue
+
 		# compute dynamic buy options each frame
 		current_max = 0
 		for s in slots:
@@ -730,6 +944,17 @@ def main():
 						my0 = (HEIGHT - ph) // 2
 						close_rect = pygame.Rect(mx0 + pw - 120, my0 + ph - 52, 100, 40)
 						help_popup = {"rect": pygame.Rect(mx0, my0, pw, ph), "close": close_rect, "scroll": 0}
+					continue
+				# Escape: prompt to return to main menu (ask to save)
+				elif event.key == pygame.K_ESCAPE:
+					# open confirm popup asking to Save & Exit / Exit without saving / Cancel
+					pw, ph = 520, 180
+					mx0 = (WIDTH - pw) // 2
+					my0 = (HEIGHT - ph) // 2
+					yes_rect = pygame.Rect(mx0 + 20, my0 + ph - 60, 140, 40)
+					no_rect = pygame.Rect(mx0 + 190, my0 + ph - 60, 140, 40)
+					cancel_rect = pygame.Rect(mx0 + 360, my0 + ph - 60, 120, 40)
+					exit_menu_popup = {"rect": pygame.Rect(mx0, my0, pw, ph), "save": yes_rect, "nosave": no_rect, "cancel": cancel_rect}
 					continue
 				# Space triggers Deal (same as clicking Deal), unless Worker is enabled
 				elif event.key == pygame.K_SPACE:
@@ -831,6 +1056,27 @@ def main():
 						help_popup = None
 						continue
 				# handle prestige confirmation popup next (blocks other UI)
+				# handle exit-to-menu confirmation popup (ESC) before other modals
+				if exit_menu_popup:
+					if exit_menu_popup["rect"].collidepoint((mx, my)):
+						# Save & Exit
+						if exit_menu_popup["save"].collidepoint((mx, my)):
+							save_path = os.path.join(os.path.dirname(__file__), "save.json")
+							saved = save_game(save_path, slots, unlocked_slots, currency, prestige_level, worker_owned, worker_enabled, time_thief_count, worker_upgraded)
+							# go to main menu regardless (saved or not)
+							exit_menu_popup = None
+							menu_active = True
+						# Exit without saving
+						elif exit_menu_popup["nosave"].collidepoint((mx, my)):
+							exit_menu_popup = None
+							menu_active = True
+						# Cancel
+						elif exit_menu_popup["cancel"].collidepoint((mx, my)):
+							exit_menu_popup = None
+					else:
+						# clicked outside popup -> close it
+						exit_menu_popup = None
+					continue
 				if prestige_popup:
 					if prestige_popup["rect"].collidepoint((mx, my)):
 						# Yes/No buttons
@@ -1521,106 +1767,38 @@ def main():
 			screen.blit(ys, (y.x + (y.width - ys.get_width())//2, y.y + (y.height - ys.get_height())//2))
 			screen.blit(ns, (n.x + (n.width - ns.get_width())//2, n.y + (n.height - ns.get_height())//2))
 
-		if help_popup:
+		if exit_menu_popup:
 			# dim background
 			over = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
 			over.fill((0, 0, 0, 160))
 			screen.blit(over, (0, 0))
-			r = help_popup["rect"]
-			pygame.draw.rect(screen, (36,36,44), (r.x, r.y, r.width, r.height), border_radius=8)
+			r = exit_menu_popup["rect"]
+			pygame.draw.rect(screen, (40, 40, 50), (r.x, r.y, r.width, r.height), border_radius=8)
 			pygame.draw.rect(screen, (200,200,220), (r.x, r.y, r.width, r.height), 2, border_radius=8)
-			# title
-			title = render_text(big_font or font, "Help & Mechanics", (230,220,200))
-			screen.blit(title, (r.x + 20, r.y + 12))
-			# build help lines including recent features and keybindings
-			max_tt = max_time_thief_count()
-			lines = [
-				"- Deals spawn coins only (one per unlocked slot).",
-				"- Selling coins opens the sell popup and grants currency.",
-				f"- Worker: buy for {WORKER_COST} and toggle On/Off; when enabled it auto-deals every 2x manual cooldown by default.",
-				f"- Worker Upgrade: available after buying {max_tt} Time Thiefs; cost = {WORKER_UPGRADE_COST}; makes the worker use the same cooldown as manual.",
-				f"- Time Thief: cost = {TIME_THIEF_COST}; each reduces the manual deal cooldown by {TIME_THIEF_REDUCTION:.2f}s (min {MIN_DEAL_COOLDOWN:.2f}s).",
-				"- Worker deals do not directly award currency; sell coins to realize value.",
-				"",
-				"Controls:",
-				"  - Press H to open/close this Help window (Help pauses worker and blocks Space).",
-				"  - Press Space to perform a Manual Deal (disabled while Worker is enabled or Help is open).",
-				"  - Ctrl+Click a slot to instantly sell 1 (identical to Sell → 1).",
-				"",
-				"Flow: Deal → Combine → Sell (sell to convert coins into currency).",
-				f"Slots: max {MAX_SLOTS}; per-slot capacity = {SLOT_CAPACITY}.",
-				"",
-				"Spawn probabilities (current):",
-			]
-			# compute spawn probs with same cap used for deals
-			prob_cap = min(max(3, max((s.coin for s in slots), default=0) + 1), unlocked_slots + 2)
-			probs = compute_spawn_probabilities(slots, cap=prob_cap)
-			for lvl in sorted(probs.keys()):
-				lines.append(f"  C{lvl}: {probs[lvl]:.1f}%")
+			msg = render_text(big_font or font, "Return to Main Menu?", (230,220,200))
+			sub_text = "Save your progress before returning to the main menu?"
+			sub = render_text_wrapped(small_font or font, sub_text, (200,200,200), r.width - 40)
+			screen.blit(msg, (r.x + 20, r.y + 12))
+			screen.blit(sub, (r.x + 20, r.y + 52))
+			# draw buttons
+			s = exit_menu_popup["save"]
+			n = exit_menu_popup["nosave"]
+			c = exit_menu_popup["cancel"]
+			pygame.draw.rect(screen, (60,100,140), s, border_radius=6)
+			pygame.draw.rect(screen, (200,200,220), s, 2, border_radius=6)
+			pygame.draw.rect(screen, (100,60,60), n, border_radius=6)
+			pygame.draw.rect(screen, (200,200,220), n, 2, border_radius=6)
+			pygame.draw.rect(screen, (80,80,80), c, border_radius=6)
+			pygame.draw.rect(screen, (200,200,220), c, 2, border_radius=6)
+			ss = render_text(small_font or font, "Save & Exit", (255,255,255))
+			ns = render_text(small_font or font, "Exit w/o Save", (255,255,255))
+			cs = render_text(small_font or font, "Cancel", (255,255,255))
+			screen.blit(ss, (s.x + (s.width - ss.get_width())//2, s.y + (s.height - ss.get_height())//2))
+			screen.blit(ns, (n.x + (n.width - ns.get_width())//2, n.y + (n.height - ns.get_height())//2))
+			screen.blit(cs, (c.x + (c.width - cs.get_width())//2, c.y + (c.height - cs.get_height())//2))
 
-			# Render all lines onto a clipped content surface so text never escapes the popup
-			content_x = r.x + 20
-			content_w = r.width - 40
-			content_y = r.y + 56
-			# prepare rendered line surfaces (wrapped to content width)
-			line_surfs = []
-			for ln in lines:
-				sur = render_text_wrapped(small_font or font, ln, (200,200,200), content_w)
-				line_surfs.append(sur)
-			# total height of content
-			total_h = sum(s.get_height() for s in line_surfs) + max(0, (len(line_surfs) - 1) * 8)
-			max_content_h = r.height - (content_y - r.y) - 20
-			if max_content_h < 1:
-				max_content_h = 1
-			# create a full content surface and blit all lines so we can scroll a viewport over it
-			full_content_surf = pygame.Surface((content_w, max(1, total_h)), pygame.SRCALPHA)
-			yi = 0
-			for s in line_surfs:
-				full_content_surf.blit(s, (0, yi))
-				yi += s.get_height() + 8
-			# visible viewport height inside popup
-			visible_h = max(1, r.height - (content_y - r.y) - 20)
-			# clamp scroll and compute viewport rect safely so it never exceeds the content surface
-			scroll = int(help_popup.get("scroll", 0)) if isinstance(help_popup, dict) else 0
-			# viewport height must not exceed full content height
-			viewport_h = min(visible_h, full_content_surf.get_height())
-			max_scroll = max(0, full_content_surf.get_height() - viewport_h)
-			if scroll < 0:
-				scroll = 0
-			if scroll > max_scroll:
-				scroll = max_scroll
-			# blit visible region (safe subsurface)
-			viewport = pygame.Rect(0, scroll, content_w, viewport_h)
-			# when content is smaller than visible area, blit the whole content and leave remaining area empty
-			if viewport_h <= 0:
-				# nothing to blit
-				pass
-			else:
-				try:
-					screen.blit(full_content_surf.subsurface(viewport), (content_x, content_y))
-				except ValueError:
-					# fallback: blit as much as possible without using subsurface
-					screen.blit(full_content_surf, (content_x, content_y))
-			# draw a simple scrollbar if content overflows
-			if full_content_surf.get_height() > visible_h:
-				sb_x = content_x + content_w + 6
-				sb_w = 8
-				ratio = visible_h / full_content_surf.get_height()
-				bar_h = max(int(visible_h * ratio), 8)
-				if max_scroll > 0:
-					bar_y = content_y + int((scroll / max_scroll) * (visible_h - bar_h))
-				else:
-					bar_y = content_y
-				# draw track
-				pygame.draw.rect(screen, (60,60,70), (sb_x, content_y, sb_w, visible_h), border_radius=4)
-				# draw thumb
-				pygame.draw.rect(screen, (140,140,160), (sb_x, bar_y, sb_w, bar_h), border_radius=4)
-			# close button
-			cr = help_popup["close"]
-			pygame.draw.rect(screen, (60,100,140), cr, border_radius=6)
-			pygame.draw.rect(screen, (200,200,220), cr, 2, border_radius=6)
-			cs = render_text(small_font or font, "Close", (255,255,255))
-			screen.blit(cs, (cr.x + (cr.width - cs.get_width())//2, cr.y + (cr.height - cs.get_height())//2))
+		if help_popup:
+			render_help_popup(help_popup)
 
 		pygame.display.flip()
 
